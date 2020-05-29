@@ -109,7 +109,8 @@ update_cxxflags() {
             -Wold-style-declaration|-Wold-style-definition|-Wredundant-decls)
                 ;;
             -std=gnu99)
-                QEMU_CXXFLAGS=${QEMU_CXXFLAGS:+$QEMU_CXXFLAGS }"-std=gnu++98"
+                # QEMU_CXXFLAGS=${QEMU_CXXFLAGS:+$QEMU_CXXFLAGS }"-std=gnu++98"
+                QEMU_CXXFLAGS=${QEMU_CXXFLAGS:+$QEMU_CXXFLAGS }"-std=c++11"
                 ;;
             *)
                 QEMU_CXXFLAGS=${QEMU_CXXFLAGS:+$QEMU_CXXFLAGS }$arg
@@ -3281,35 +3282,6 @@ EOF
   fi
 fi
 
-
-# Xbox hack to include ogl framework
-if test "$darwin" = "yes" ; then
-    sdl_libs="$sdl_libs -framework OpenGL"
-#     cat > $TMPC << EOF
-# #include <OpenGL/gl.h>
-# #include <OpenGL/CGLTypes.h>
-# #include <OpenGL/CGLCurrent.h>
-# int main(void) { return GL_VERSION != 0; }
-# EOF
-fi
-
-if test "$linux" = "yes" ; then
-    sdl_libs="$sdl_libs -lGLU -lGL"
-fi
-
-##########################################
-# epoxy probe
-
-if $pkg_config --exists epoxy ; then
-    epoxy_libs=$($pkg_config --libs epoxy)
-    epoxy_flags=$($pkg_config --cflags epoxy)
-else
-    error_exit "epoxy not present." \
-        "Please install the epoxy devel package."
-fi
-LIBS="$LIBS $epoxy_libs"
-QEMU_CFLAGS="$QEMU_CFLAGS $epoxy_flags"
-
 ##########################################
 # RDMA needs OpenFabrics libraries
 if test "$rdma" != "no" ; then
@@ -4343,6 +4315,9 @@ if $pkg_config gbm; then
     gbm="yes"
 fi
 
+# XBOX: Just skip this, don't need it rn
+if false ; then
+
 if test "$opengl" != "no" ; then
   opengl_pkgs="epoxy gbm"
   if $pkg_config $opengl_pkgs; then
@@ -4384,6 +4359,71 @@ if test "$opengl" = "yes" && test "$have_x11" = "yes"; then
       ;;
     esac
   done
+fi
+
+fi # XBOX
+
+# XBOX
+if test "$opengl" != "no" ; then
+  if test "$darwin" = "yes" ; then
+    opengl_libs="$opengl_libs -framework OpenGL"
+  elif test "$mingw32" = "yes" ; then
+    opengl_libs="$opengl_libs -lopengl32 -lgdi32"
+  elif test "$linux" = "yes" ; then
+    opengl_libs="$opengl_libs -lGLU -lGL"
+  fi
+  opengl_libs="$opengl_libs $($pkg_config --libs epoxy)"
+  opengl_cflags="$opengl_cflags $($pkg_config --cflags epoxy)"
+  QEMU_CFLAGS="$QEMU_CFLAGS $opengl_cflags"
+fi # test "$opengl" != "no"
+
+##########################################
+# epoxy probe
+
+# if $pkg_config --exists epoxy ; then
+#     epoxy_libs=$($pkg_config --libs epoxy)
+#     epoxy_flags=$($pkg_config --cflags epoxy)
+# else
+#     error_exit "epoxy not present." \
+#         "Please install the epoxy devel package."
+# fi
+# LIBS="$LIBS $epoxy_libs"
+# QEMU_CFLAGS="$QEMU_CFLAGS $epoxy_flags"
+
+
+##########################################
+# gtk probe
+
+# Depend on GTK for native file dialog boxes
+# FIXME: Add fallback when GTK is unavailable
+xemu_gtk="no"
+if test "$linux" = "yes" ; then
+    xemu_gtk="yes"
+fi
+
+if test "$xemu_gtk" != "no"; then
+    gtkpackage="gtk+-3.0"
+    gtkversion="3.14.0"
+    if $pkg_config --exists "$gtkpackage >= $gtkversion"; then
+        xemu_gtk_cflags=$($pkg_config --cflags $gtkpackage)
+        xemu_gtk_libs=$($pkg_config --libs $gtkpackage)
+        xemu_gtk_version=$($pkg_config --modversion $gtkpackage)
+        # Add GTK libraries/flags to SDL module. While this could be cleaner,
+        # it's only used for the xemu UI.
+        sdl_libs="$sdl_libs $xemu_gtk_libs"
+        sdl_cflags="$sdl_cflags $xemu_gtk_cflags"
+    elif test "$xemu_gtk" = "yes"; then
+        feature_not_found "gtk" "Install gtk3-devel"
+    fi
+fi
+
+##########################################
+# openssl probe
+if $pkg_config --exists openssl; then
+    QEMU_CFLAGS="$QEMU_CFLAGS $($pkg_config --cflags openssl)"
+    LIBS="$LIBS $($pkg_config --libs openssl)"
+else
+    feature_not_found "openssl" "Install openssl-dev"
 fi
 
 ##########################################

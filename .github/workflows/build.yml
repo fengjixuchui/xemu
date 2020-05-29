@@ -38,6 +38,9 @@ jobs:
           print('::set-env name=ARTIFACT_NAME::xemu-win-release.zip')
     - name: Clone Tree
       uses: actions/checkout@v2
+    - name: Clone Tree (Unshallow)
+      run: |
+        git fetch --prune --unshallow --tags
     - name: Install Dependencies
       run: |
         echo "Downloading MSYS2 environment..."
@@ -86,20 +89,24 @@ jobs:
         if "${{ matrix.configuration }}" == "Debug":
           print('Configuring for Debug')
           print('::set-env name=BUILD_PARAM::--debug')
-          print('::set-env name=ARTIFACT_NAME::xemu-ubuntu-debug')
+          print('::set-env name=ARTIFACT_NAME::xemu-ubuntu-debug.tgz')
         else:
           print('Configuring for Release')
           print('::set-env name=BUILD_PARAM::')
-          print('::set-env name=ARTIFACT_NAME::xemu-ubuntu-release')
+          print('::set-env name=ARTIFACT_NAME::xemu-ubuntu-release.tgz')
     - name: Clone Tree
       uses: actions/checkout@v2
+    - name: Clone Tree (Unshallow)
+      run: |
+        git fetch --prune --unshallow --tags
     - name: Install Dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y \
-          libsdl2-dev \
           libepoxy-dev \
+          libgtk-3-dev \
           libpixman-1-dev \
+          libsdl2-dev \
           ccache
     - name: Initialize Compiler Cache
       id: cache
@@ -116,6 +123,12 @@ jobs:
         ./build.sh ${{ env.BUILD_PARAM }}
         echo -e "\nCompiler Cache Stats:"
         ccache -s -c
+        tar -czvf ${{env.ARTIFACT_NAME}} --transform "s#^dist#xemu#" dist
+    - name: Upload Build Artifact
+      uses: actions/upload-artifact@v1
+      with:
+        name: dist
+        path: ${{env.ARTIFACT_NAME}}
 
   macOS:
     runs-on: macOS-latest
@@ -130,24 +143,28 @@ jobs:
         if "${{ matrix.configuration }}" == "Debug":
           print('Configuring for Debug')
           print('::set-env name=BUILD_PARAM::--debug')
-          print('::set-env name=ARTIFACT_NAME::xemu-macos-debug')
+          print('::set-env name=ARTIFACT_NAME::xemu-macos-debug.zip')
         else:
           print('Configuring for Release')
           print('::set-env name=BUILD_PARAM::')
-          print('::set-env name=ARTIFACT_NAME::xemu-macos-release')
+          print('::set-env name=ARTIFACT_NAME::xemu-macos-release.zip')
     - name: Clone Tree
       uses: actions/checkout@v2
+    - name: Clone Tree (Unshallow)
+      run: |
+        git fetch --prune --unshallow --tags
     - name: Install Dependencies
       run: |
         brew update
         brew unlink python@2
         brew install \
-          pixman \
-          sdl2 \
-          libepoxy \
+          ccache \
           coreutils \
+          dylibbundler \
+          libepoxy \
+          pixman \
           pkg-config \
-          ccache
+          sdl2
     - name: Initialize Compiler Cache
       id: cache
       uses: actions/cache@v1
@@ -163,6 +180,14 @@ jobs:
         ./build.sh ${{ env.BUILD_PARAM }}
         echo -e "\nCompiler Cache Stats:"
         ccache -s -c
+        pushd dist
+        zip -r ../${{env.ARTIFACT_NAME}} xemu.app
+        popd
+    - name: Upload Build Artifact
+      uses: actions/upload-artifact@v1
+      with:
+        name: dist
+        path: ${{env.ARTIFACT_NAME}}
 
   Release:
     runs-on: ubuntu-latest
@@ -199,7 +224,6 @@ jobs:
         asset_name: xemu-win-debug.zip
         asset_path: dist/xemu-win-debug.zip
         asset_content_type: application/zip
-
     - name: Upload Release Assets (Windows Release Build)
       if: github.event_name == 'push' && github.ref == 'refs/heads/master'
       id: upload-release-asset-win-release
@@ -211,3 +235,64 @@ jobs:
         asset_name: xemu-win-release.zip
         asset_path: dist/xemu-win-release.zip
         asset_content_type: application/zip
+    - name: Upload Release Assets (macOS Release Build)
+      if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+      id: upload-release-asset-macos-release
+      uses: actions/upload-release-asset@v1.0.1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_name: xemu-macos-release.zip
+        asset_path: dist/xemu-macos-release.zip
+        asset_content_type: application/zip
+    - name: Upload Release Assets (macOS Debug Build)
+      if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+      id: upload-release-asset-macos-debug
+      uses: actions/upload-release-asset@v1.0.1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_name: xemu-macos-debug.zip
+        asset_path: dist/xemu-macos-debug.zip
+        asset_content_type: application/zip
+
+  # Sync archive version of source (including submodule code) to the
+  # ppa-snapshot branch to work around limitations of the Launchpad platform,
+  # namely: no network egress on package build, no custom scripting in source
+  # package creation.
+  PushToPPA:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: [Ubuntu, Windows, macOS]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Clone Tree
+      uses: actions/checkout@v2
+    - name: Clone Tree (Unshallow)
+      run: |
+        git fetch --prune --unshallow --tags
+    - name: Create Source Archive
+      run: |
+        ./scripts/archive-source.sh archive.tgz
+        mkdir archive
+        pushd archive
+        tar xf ../archive.tgz
+        popd
+    - name: Integrate Debian Packaging
+      run: |
+        # Clone deb branch containing packaging files
+        git clone --branch=deb --depth=1 https://github.com/mborgerson/xemu.git /tmp/xemu-debian
+        mv /tmp/xemu-debian/debian archive
+
+        # Create changelog containing current version
+        echo -e "xemu (1:$(cat archive/XEMU_VERSION)-0) unstable; urgency=medium\n" > archive/debian/changelog
+        echo -e "  Built from $(cat archive/XEMU_VERSION)\n" >> archive/debian/changelog
+        echo " -- Matt Borgerson <contact@mborgerson.com>  $(date -R)" >> archive/debian/changelog
+    - name: Deploy Source Archive to Branch
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: ./archive
+        publish_branch: ppa-snapshot
+        force_orphan: true
