@@ -547,7 +547,6 @@ private:
     char flash_path[MAX_STRING_LEN];
     char bootrom_path[MAX_STRING_LEN];
     char hdd_path[MAX_STRING_LEN];
-    char dvd_path[MAX_STRING_LEN];
     char eeprom_path[MAX_STRING_LEN];
     int  memory_idx;
     bool short_animation;
@@ -562,7 +561,6 @@ public:
         flash_path[0] = '\0';
         bootrom_path[0] = '\0';
         hdd_path[0] = '\0';
-        dvd_path[0] = '\0';
         eeprom_path[0] = '\0';
         memory_idx = 0;
         short_animation = false;
@@ -593,11 +591,6 @@ public:
         assert(len < MAX_STRING_LEN);
         strncpy(hdd_path, tmp, sizeof(hdd_path));
 
-        xemu_settings_get_string(XEMU_SETTINGS_SYSTEM_DVD_PATH, &tmp);
-        len = strlen(tmp);
-        assert(len < MAX_STRING_LEN);
-        strncpy(dvd_path, tmp, sizeof(dvd_path));
-
         xemu_settings_get_string(XEMU_SETTINGS_SYSTEM_EEPROM_PATH, &tmp);
         len = strlen(tmp);
         assert(len < MAX_STRING_LEN);
@@ -617,7 +610,6 @@ public:
         xemu_settings_set_string(XEMU_SETTINGS_SYSTEM_FLASH_PATH, flash_path);
         xemu_settings_set_string(XEMU_SETTINGS_SYSTEM_BOOTROM_PATH, bootrom_path);
         xemu_settings_set_string(XEMU_SETTINGS_SYSTEM_HDD_PATH, hdd_path);
-        xemu_settings_set_string(XEMU_SETTINGS_SYSTEM_DVD_PATH, dvd_path);
         xemu_settings_set_string(XEMU_SETTINGS_SYSTEM_EEPROM_PATH, eeprom_path);
         xemu_settings_set_int(XEMU_SETTINGS_SYSTEM_MEMORY, 64+memory_idx*64);
         xemu_settings_set_bool(XEMU_SETTINGS_SYSTEM_SHORTANIM, short_animation);
@@ -659,7 +651,6 @@ public:
         }
 
         const char *rom_file_filters = ".bin Files\0*.bin\0.rom Files\0*.rom\0All Files\0*.*\0";
-        const char *iso_file_filters = ".iso Files\0*.iso\0All Files\0*.*\0";
         const char *qcow_file_filters = ".qcow2 Files\0*.qcow2\0All Files\0*.*\0";
 
         ImGui::Columns(2, "", false);
@@ -672,7 +663,7 @@ public:
         FilePicker("###Flash", flash_path, sizeof(flash_path), rom_file_filters);
         ImGui::NextColumn();
 
-        ImGui::Text("BootROM File");
+        ImGui::Text("MCPX Boot ROM File");
         ImGui::NextColumn();
         ImGui::SetNextItemWidth(picker_width);
         FilePicker("###BootROM", bootrom_path, sizeof(bootrom_path), rom_file_filters);
@@ -682,12 +673,6 @@ public:
         ImGui::NextColumn();
         ImGui::SetNextItemWidth(picker_width);
         FilePicker("###HDD", hdd_path, sizeof(hdd_path), qcow_file_filters);
-        ImGui::NextColumn();
-
-        ImGui::Text("DVD Image File");
-        ImGui::NextColumn();
-        ImGui::SetNextItemWidth(picker_width);
-        FilePicker("###DVD", dvd_path, sizeof(dvd_path), iso_file_filters);
         ImGui::NextColumn();
 
         ImGui::Text("EEPROM File");
@@ -958,6 +943,9 @@ public:
     bool is_open;
     bool is_xbe_identified;
     bool did_send, send_result;
+    char token_buf[512];
+    int playability;
+    char description[1024];
     std::string serialized_report;
 
     CompatibilityReporter()
@@ -993,6 +981,22 @@ public:
     {
         if (!is_open) return;
 
+        const char *playability_names[] = {
+            "Broken",
+            "Intro",
+            "Starts",
+            "Playable",
+            "Perfect",
+        };
+
+        const char *playability_descriptions[] = {
+            "This title crashes very soon after launching, or displays nothing at all.",
+            "This title displays an intro sequence, but fails to make it to gameplay.",
+            "This title starts, but may crash or have significant issues.",
+            "This title is playable from start to finish, with only minor issues.",
+            "This title is playable from start to finish with no noticable issues."
+        };
+
         ImGui::SetNextWindowContentSize(ImVec2(550.0f*g_ui_scale, 0.0f));
         if (!ImGui::Begin("Report Compatibility", &is_open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::End();
@@ -1010,6 +1014,19 @@ public:
                 report.SetXbeData(xbe);
             }
             did_send = send_result = false;
+
+            playability = 3; // Playable
+            report.compat_rating = playability_names[playability];
+            description[0] = '\x00';
+            report.compat_comments = description;
+
+            const char *tmp;
+            xemu_settings_get_string(XEMU_SETTINGS_MISC_USER_TOKEN, &tmp);
+            assert(strlen(tmp) < sizeof(token_buf));
+            strncpy(token_buf, tmp, sizeof(token_buf));
+            report.token = token_buf;
+
+            dirty = true;
         }
 
         if (!is_xbe_identified) {
@@ -1038,45 +1055,36 @@ public:
         
         ImGui::Text("User Token");
         ImGui::SameLine();
-        HelpMarker("Optional. This is a unique token that users may "
-            "provide in order to associate their report with their Discord "
-            "username. To request a token, click 'Get Token'.");    
+        HelpMarker("This is a unique access token used to authorize submission of the report. To request a token, click 'Get Token'.");
         ImGui::NextColumn();
-        float item_width = ImGui::GetColumnWidth()-20*g_ui_scale;
-        ImGui::SetNextItemWidth(item_width*0.70);
-        static char token_buf[512] = {0};
+        float item_width = ImGui::GetColumnWidth()*0.75-20*g_ui_scale;
+        ImGui::SetNextItemWidth(item_width);
+        ImGui::PushFont(g_fixed_width_font);
         if (ImGui::InputText("###UserToken", token_buf, sizeof(token_buf), 0)) {
             report.token = token_buf;
             dirty = true;
         }
+        ImGui::PopFont();
         ImGui::SameLine();
         if (ImGui::Button("Get Token")) {
-            xemu_open_web_browser("https://xemu.app");
+            xemu_open_web_browser("https://reports.xemu.app");
         }
         ImGui::NextColumn();
 
         ImGui::Text("Playability");
         ImGui::NextColumn();
-        static int playability;
         ImGui::SetNextItemWidth(item_width);
-        const char *playability_names[] = {
-            "Unknown",
-            "Broken",
-            "Intro/Menus",
-            "Starts",
-            "Playable",
-            "Perfect",
-        };
         if (ImGui::Combo("###PlayabilityRating", &playability,
-            "Unknown\0" "Broken\0" "Intro/Menus\0" "Starts\0" "Playable\0" "Perfect\0")) {
+            "Broken\0" "Intro/Menus\0" "Starts\0" "Playable\0" "Perfect\0")) {
             report.compat_rating = playability_names[playability];
             dirty = true;
         }
+        ImGui::SameLine();
+        HelpMarker(playability_descriptions[playability]);
         ImGui::NextColumn();
         
         ImGui::Columns(1);
         
-        static char description[1024] = {0};
         ImGui::Text("Description");
         if (ImGui::InputTextMultiline("###desc", description, sizeof(description), ImVec2(-FLT_MIN, ImGui::GetTextLineHeight() * 6), 0)) {
             report.compat_comments = description;
@@ -1103,8 +1111,8 @@ public:
                 "seen before submission by expanding 'Report Details'."
                 "\n\n"
                 "Like many websites, upon submission, the public IP address of your computer is "
-                "also recorded with your report. If you choose to submit with a token, the "
-                "identity associated with your token (e.g. Discord username) is also recorded. "
+                "also recorded with your report. If provided, the identity associated with your "
+                "token is also recorded."
                 "\n\n"
                 "This information will be archived and used to analyze, resolve problems with, "
                 "and improve the application. This information may be made publicly visible, "
@@ -1132,6 +1140,14 @@ public:
         if (ImGui::Button("Send", ImVec2(120*g_ui_scale, 0))) {
             did_send = true;
             send_result = report.Send();
+            if (send_result) {
+                // Close window on success
+                is_open = false;
+
+                // Save user token if it was used
+                xemu_settings_set_string(XEMU_SETTINGS_MISC_USER_TOKEN, token_buf);
+                xemu_settings_save();
+            }
         }
         
         ImGui::End();
@@ -1229,6 +1245,84 @@ public:
     }
 };
 
+static bool is_shortcut_key_pressed(int scancode)
+{
+    ImGuiIO& io = ImGui::GetIO();
+    const bool is_osx = io.ConfigMacOSXBehaviors;
+    const bool is_shortcut_key = (is_osx ? (io.KeySuper && !io.KeyCtrl) : (io.KeyCtrl && !io.KeySuper)) && !io.KeyAlt && !io.KeyShift; // OS X style: Shortcuts using Cmd/Super instead of Ctrl
+    return is_shortcut_key && io.KeysDown[scancode] && (io.KeysDownDuration[scancode] == 0.0);
+}
+
+static void action_eject_disc(void)
+{
+    xemu_settings_set_string(XEMU_SETTINGS_SYSTEM_DVD_PATH, "");
+    xemu_settings_save();
+    xemu_eject_disc();
+}
+
+static void action_load_disc(void)
+{
+    const char *iso_file_filters = ".iso Files\0*.iso\0All Files\0*.*\0";
+    const char *current_disc_path;
+    xemu_settings_get_string(XEMU_SETTINGS_SYSTEM_DVD_PATH, &current_disc_path);
+    const char *new_disc_path = noc_file_dialog_open(NOC_FILE_DIALOG_OPEN, iso_file_filters, current_disc_path, NULL);
+    if (new_disc_path == NULL) {
+        /* Cancelled */
+        return;
+    }
+    xemu_settings_set_string(XEMU_SETTINGS_SYSTEM_DVD_PATH, new_disc_path);
+    xemu_settings_save();
+    xemu_load_disc(new_disc_path);
+}
+
+static void action_toggle_pause(void)
+{
+    if (runstate_is_running()) {
+        vm_stop(RUN_STATE_PAUSED);
+    } else {
+        vm_start();
+    }
+}
+
+static void action_reset(void)
+{
+    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+}
+
+static void action_shutdown(void)
+{
+    qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+}
+
+static void process_keyboard_shortcuts(void)
+{
+    if (is_shortcut_key_pressed(SDL_SCANCODE_E)) {
+        action_eject_disc();
+    }
+
+    if (is_shortcut_key_pressed(SDL_SCANCODE_O)) {
+        action_load_disc();
+    }
+
+    if (is_shortcut_key_pressed(SDL_SCANCODE_P)) {
+        action_toggle_pause();
+    }
+
+    if (is_shortcut_key_pressed(SDL_SCANCODE_R)) {
+        action_reset();
+    }
+
+    if (is_shortcut_key_pressed(SDL_SCANCODE_Q)) {
+        action_shutdown();
+    }
+}
+
+#if defined(__APPLE__)
+#define SHORTCUT_MENU_TEXT(c) "Cmd+" #c
+#else
+#define SHORTCUT_MENU_TEXT(c) "Ctrl+" #c
+#endif
+
 static void ShowMainMenu()
 {
     bool running = runstate_is_running();
@@ -1237,26 +1331,29 @@ static void ShowMainMenu()
     {
         if (ImGui::BeginMenu("Machine"))
         {
+            if (ImGui::MenuItem("Eject Disc", SHORTCUT_MENU_TEXT(E))) {
+                action_eject_disc();
+            }
+            if (ImGui::MenuItem("Load Disc...", SHORTCUT_MENU_TEXT(O))) {
+                action_load_disc();
+            }
+
+            ImGui::Separator();
+
             ImGui::MenuItem("Input",    NULL, &input_window.is_open);
             ImGui::MenuItem("Network",  NULL, &network_window.is_open);
             ImGui::MenuItem("Settings", NULL, &settings_window.is_open);
+
             ImGui::Separator();
-            if (ImGui::MenuItem(running ? "Pause" : "Run")) {
-                if (running) {
-                    vm_stop(RUN_STATE_PAUSED);
-                } else {
-                    vm_start();
-                }
+
+            if (ImGui::MenuItem(running ? "Pause" : "Run", SHORTCUT_MENU_TEXT(P))) {
+                action_toggle_pause();
             }
-            // FIXME: Disabled for now because nv2a crashes during resets. This
-            // will be fixed shortly.
-            #if 0
-            if (ImGui::MenuItem("Restart")) {
-                qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+            if (ImGui::MenuItem("Reset", SHORTCUT_MENU_TEXT(R))) {
+                action_reset();
             }
-            #endif
-            if (ImGui::MenuItem("Shutdown")) {
-                qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+            if (ImGui::MenuItem("Shutdown", SHORTCUT_MENU_TEXT(Q))) {
+                action_shutdown();
             }
             ImGui::EndMenu();
         }
@@ -1534,6 +1631,7 @@ void xemu_hud_render(void)
     MAP_ANALOG(ImGuiNavInput_LStickDown,    CONTROLLER_AXIS_LSTICK_Y, -thumb_dead_zone, -32767);
 
     ImGui::NewFrame();
+    process_keyboard_shortcuts();
 
     bool show_main_menu = true;
 

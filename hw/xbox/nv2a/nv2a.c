@@ -3,7 +3,7 @@
  *
  * Copyright (c) 2012 espes
  * Copyright (c) 2015 Jannik Vogel
- * Copyright (c) 2018 Matt Borgerson
+ * Copyright (c) 2018-2020 Matt Borgerson
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -26,6 +26,8 @@
 #include "qemu/main-loop.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "migration/vmstate.h"
+#include "sysemu/runstate.h"
 
 #include "hw/hw.h"
 #include "hw/display/vga.h"
@@ -93,9 +95,9 @@ static void update_irq(NV2AState *d)
 
     if (d->pmc.pending_interrupts && d->pmc.enabled_interrupts) {
         NV2A_DPRINTF("raise irq\n");
-        pci_irq_assert(&d->dev);
+        pci_irq_assert(PCI_DEVICE(d));
     } else {
-        pci_irq_deassert(&d->dev);
+        pci_irq_deassert(PCI_DEVICE(d));
     }
 }
 
@@ -391,7 +393,7 @@ static void nv2a_init_memory(NV2AState *d, MemoryRegion *ram)
      /* PCI exposed vram */
     memory_region_init_alias(&d->vram_pci, OBJECT(d), "nv2a-vram-pci", d->vram,
                              0, memory_region_size(d->vram));
-    pci_register_bar(&d->dev, 1, PCI_BASE_ADDRESS_MEM_PREFETCH, &d->vram_pci);
+    pci_register_bar(PCI_DEVICE(d), 1, PCI_BASE_ADDRESS_MEM_PREFETCH, &d->vram_pci);
 
 
     /* RAMIN - should be in vram somewhere, but not quite sure where atm */
@@ -419,40 +421,70 @@ static void nv2a_init_memory(NV2AState *d, MemoryRegion *ram)
 
     pgraph_init(d);
 
-    /* fire up puller */
-    qemu_thread_create(&d->pfifo.puller_thread, "nv2a.puller_thread",
-                       pfifo_puller_thread,
-                       d, QEMU_THREAD_JOINABLE);
+    /* fire up pfifo */
+    qemu_thread_create(&d->pfifo.thread, "nv2a.pfifo_thread",
+                       pfifo_thread, d, QEMU_THREAD_JOINABLE);
+}
 
-    /* fire up pusher */
-    qemu_thread_create(&d->pfifo.pusher_thread, "nv2a.pusher_thread",
-                       pfifo_pusher_thread,
-                       d, QEMU_THREAD_JOINABLE);
+static void nv2a_lock_fifo(NV2AState *d)
+{
+    qemu_mutex_lock(&d->pfifo.lock);
+    qemu_cond_broadcast(&d->pfifo.fifo_cond);
+    qemu_mutex_unlock_iothread();
+    qemu_cond_wait(&d->pfifo.fifo_idle_cond, &d->pfifo.lock);
+    qemu_mutex_lock_iothread();
+    qemu_mutex_lock(&d->pgraph.lock);
+}
+
+static void nv2a_unlock_fifo(NV2AState *d)
+{
+    pfifo_kick(d);
+    qemu_mutex_unlock(&d->pgraph.lock);
+    qemu_mutex_unlock(&d->pfifo.lock);
+}
+
+static void nv2a_reset(NV2AState *d)
+{
+    nv2a_lock_fifo(d);
+
+    memset(d->pfifo.regs, 0, sizeof(d->pfifo.regs));
+    memset(d->pgraph.regs, 0, sizeof(d->pgraph.regs));
+
+    d->pcrtc.start = 0;
+    d->pramdac.core_clock_coeff = 0x00011c01; /* 189MHz...? */
+    d->pramdac.core_clock_freq = 189000000;
+    d->pramdac.memory_clock_coeff = 0;
+    d->pramdac.video_clock_coeff = 0x0003C20D; /* 25182Khz...? */
+
+    d->pfifo.regs[NV_PFIFO_CACHE1_STATUS] |= NV_PFIFO_CACHE1_STATUS_LOW_MARK;
+
+    vga_common_reset(&d->vga);
+
+    d->pgraph.waiting_for_nop = false;
+    d->pgraph.waiting_for_flip = false;
+    d->pgraph.waiting_for_fifo_access = false;
+    d->pgraph.waiting_for_context_switch = false;
+    d->pgraph.flush_pending = false;
+
+    d->pmc.pending_interrupts = 0;
+    d->pfifo.pending_interrupts = 0;
+    d->ptimer.pending_interrupts = 0;
+    d->pcrtc.pending_interrupts = 0;
+
+    nv2a_unlock_fifo(d);
 }
 
 static void nv2a_realize(PCIDevice *dev, Error **errp)
 {
-    int i;
-    NV2AState *d;
-
-    d = NV2A_DEVICE(dev);
+    NV2AState *d = NV2A_DEVICE(dev);
 
     /* setting subsystem ids again, see comment in nv2a_class_init() */
     pci_set_word(dev->config + PCI_SUBSYSTEM_VENDOR_ID, 0);
     pci_set_word(dev->config + PCI_SUBSYSTEM_ID, 0);
     dev->config[PCI_INTERRUPT_PIN] = 0x01;
 
-    d->pcrtc.start = 0;
-
-    d->pramdac.core_clock_coeff = 0x00011c01; /* 189MHz...? */
-    d->pramdac.core_clock_freq = 189000000;
-    d->pramdac.memory_clock_coeff = 0;
-    d->pramdac.video_clock_coeff = 0x0003C20D; /* 25182Khz...? */
-
     /* legacy VGA shit */
     VGACommonState *vga = &d->vga;
-    vga_common_reset(vga);
-
     vga->vram_size_mb = 64;
     /* seems to start in color mode */
     vga->msr = VGA_MIS_COLOR;
@@ -468,9 +500,9 @@ static void nv2a_realize(PCIDevice *dev, Error **errp)
 
     /* mmio */
     memory_region_init(&d->mmio, OBJECT(dev), "nv2a-mmio", 0x1000000);
-    pci_register_bar(&d->dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &d->mmio);
+    pci_register_bar(PCI_DEVICE(d), 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &d->mmio);
 
-    for (i=0; i<ARRAY_SIZE(blocktable); i++) {
+    for (int i=0; i < ARRAY_SIZE(blocktable); i++) {
         if (!blocktable[i].name) continue;
         memory_region_init_io(&d->block_mmio[i], OBJECT(dev),
                               &blocktable[i].ops, d,
@@ -480,10 +512,8 @@ static void nv2a_realize(PCIDevice *dev, Error **errp)
     }
 
     qemu_mutex_init(&d->pfifo.lock);
-    qemu_cond_init(&d->pfifo.puller_cond);
-    qemu_cond_init(&d->pfifo.pusher_cond);
-
-    d->pfifo.regs[NV_PFIFO_CACHE1_STATUS] |= NV_PFIFO_CACHE1_STATUS_LOW_MARK;
+    qemu_cond_init(&d->pfifo.fifo_cond);
+    qemu_cond_init(&d->pfifo.fifo_idle_cond);
 }
 
 static void nv2a_exitfn(PCIDevice *dev)
@@ -493,13 +523,181 @@ static void nv2a_exitfn(PCIDevice *dev)
 
     d->exiting = true;
 
-    qemu_cond_broadcast(&d->pfifo.puller_cond);
-    qemu_cond_broadcast(&d->pfifo.pusher_cond);
-    qemu_thread_join(&d->pfifo.puller_thread);
-    qemu_thread_join(&d->pfifo.pusher_thread);
+    qemu_cond_broadcast(&d->pfifo.fifo_cond);
+    qemu_thread_join(&d->pfifo.thread);
 
     pgraph_destroy(&d->pgraph);
 }
+
+static void qdev_nv2a_reset(DeviceState *dev)
+{
+    NV2AState *d = NV2A_DEVICE(dev);
+    nv2a_reset(d);
+}
+
+// Note: This is handled as a VM state change and not as a `pre_save` callback
+// because we want to halt the FIFO before any VM state is saved/restored to
+// avoid corruption.
+static void nv2a_vm_state_change(void *opaque, int running, RunState state)
+{
+    NV2AState *d = opaque;
+    if (state == RUN_STATE_SAVE_VM) {
+        nv2a_lock_fifo(d);
+    } else if (state == RUN_STATE_RESTORE_VM) {
+        nv2a_reset(d); // Early reset to avoid changing any state during load
+    }
+}
+
+static int nv2a_post_save(void *opaque)
+{
+    NV2AState *d = opaque;
+    nv2a_unlock_fifo(d);
+    return 0;
+}
+
+static int nv2a_pre_load(void *opaque)
+{
+    NV2AState *d = opaque;
+    nv2a_lock_fifo(d);
+    return 0;
+}
+
+static int nv2a_post_load(void *opaque, int version_id)
+{
+    NV2AState *d = opaque;
+    d->pgraph.flush_pending = true;
+    nv2a_unlock_fifo(d);
+    return 0;
+}
+
+const VMStateDescription vmstate_nv2a_pgraph_vertex_attributes = {
+    .name = "nv2a/pgraph/vertex-attr",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .minimum_version_id_old = 1,
+    .fields = (VMStateField[]) {
+        // FIXME
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static const VMStateDescription vmstate_nv2a = {
+    .name = "nv2a",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_save = nv2a_post_save,
+    .post_load = nv2a_post_load,
+    .pre_load = nv2a_pre_load,
+    .fields = (VMStateField[]) {
+        // FIXME: Split this up into subsections
+        VMSTATE_PCI_DEVICE(parent_obj, NV2AState),
+        VMSTATE_STRUCT(vga, NV2AState, 0, vmstate_vga_common, VGACommonState),
+        VMSTATE_UINT32(pgraph.pending_interrupts, NV2AState),
+        VMSTATE_UINT32(pgraph.enabled_interrupts, NV2AState),
+        VMSTATE_UINT64(pgraph.context_surfaces_2d.object_instance, NV2AState),
+        VMSTATE_UINT64(pgraph.context_surfaces_2d.dma_image_source, NV2AState),
+        VMSTATE_UINT64(pgraph.context_surfaces_2d.dma_image_dest, NV2AState),
+        VMSTATE_UINT32(pgraph.context_surfaces_2d.color_format, NV2AState),
+        VMSTATE_UINT32(pgraph.context_surfaces_2d.source_pitch, NV2AState),
+        VMSTATE_UINT32(pgraph.context_surfaces_2d.dest_pitch, NV2AState),
+        VMSTATE_UINT64(pgraph.context_surfaces_2d.source_offset, NV2AState),
+        VMSTATE_UINT64(pgraph.context_surfaces_2d.dest_offset, NV2AState),
+        VMSTATE_UINT64(pgraph.image_blit.object_instance, NV2AState),
+        VMSTATE_UINT64(pgraph.image_blit.context_surfaces, NV2AState),
+        VMSTATE_UINT32(pgraph.image_blit.operation, NV2AState),
+        VMSTATE_UINT32(pgraph.image_blit.in_x, NV2AState),
+        VMSTATE_UINT32(pgraph.image_blit.in_y, NV2AState),
+        VMSTATE_UINT32(pgraph.image_blit.out_x, NV2AState),
+        VMSTATE_UINT32(pgraph.image_blit.out_y, NV2AState),
+        VMSTATE_UINT32(pgraph.image_blit.width, NV2AState),
+        VMSTATE_UINT32(pgraph.image_blit.height, NV2AState),
+        VMSTATE_UINT64(pgraph.kelvin.object_instance, NV2AState),
+        VMSTATE_UINT64(pgraph.dma_color, NV2AState),
+        VMSTATE_UINT64(pgraph.dma_zeta, NV2AState),
+        VMSTATE_BOOL(pgraph.surface_color.draw_dirty, NV2AState),
+        VMSTATE_BOOL(pgraph.surface_zeta.draw_dirty, NV2AState),
+        VMSTATE_BOOL(pgraph.surface_color.buffer_dirty, NV2AState),
+        VMSTATE_BOOL(pgraph.surface_zeta.buffer_dirty, NV2AState),
+        VMSTATE_BOOL(pgraph.surface_color.write_enabled_cache, NV2AState),
+        VMSTATE_BOOL(pgraph.surface_zeta.write_enabled_cache, NV2AState),
+        VMSTATE_UINT32(pgraph.surface_color.pitch, NV2AState),
+        VMSTATE_UINT32(pgraph.surface_zeta.pitch, NV2AState),
+        VMSTATE_UINT64(pgraph.surface_color.offset, NV2AState),
+        VMSTATE_UINT64(pgraph.surface_zeta.offset, NV2AState),
+        VMSTATE_UINT32(pgraph.surface_type, NV2AState),
+        VMSTATE_UINT32(pgraph.surface_shape.z_format, NV2AState),
+        VMSTATE_UINT32(pgraph.surface_shape.color_format, NV2AState),
+        VMSTATE_UINT32(pgraph.surface_shape.zeta_format, NV2AState),
+        VMSTATE_UINT32(pgraph.surface_shape.log_width, NV2AState),
+        VMSTATE_UINT32(pgraph.surface_shape.log_height, NV2AState),
+        VMSTATE_UINT32(pgraph.surface_shape.clip_x, NV2AState),
+        VMSTATE_UINT32(pgraph.surface_shape.clip_width, NV2AState),
+        VMSTATE_UINT32(pgraph.surface_shape.clip_height, NV2AState),
+        VMSTATE_UINT32(pgraph.surface_shape.anti_aliasing, NV2AState),
+        VMSTATE_UINT32(pgraph.last_surface_shape.z_format, NV2AState),
+        VMSTATE_UINT32(pgraph.last_surface_shape.color_format, NV2AState),
+        VMSTATE_UINT32(pgraph.last_surface_shape.zeta_format, NV2AState),
+        VMSTATE_UINT32(pgraph.last_surface_shape.log_width, NV2AState),
+        VMSTATE_UINT32(pgraph.last_surface_shape.log_height, NV2AState),
+        VMSTATE_UINT32(pgraph.last_surface_shape.clip_x, NV2AState),
+        VMSTATE_UINT32(pgraph.last_surface_shape.clip_width, NV2AState),
+        VMSTATE_UINT32(pgraph.last_surface_shape.clip_height, NV2AState),
+        VMSTATE_UINT32(pgraph.last_surface_shape.anti_aliasing, NV2AState),
+        VMSTATE_UINT64(pgraph.dma_a, NV2AState),
+        VMSTATE_UINT64(pgraph.dma_b, NV2AState),
+        VMSTATE_UINT64(pgraph.dma_state, NV2AState),
+        VMSTATE_UINT64(pgraph.dma_notifies, NV2AState),
+        VMSTATE_UINT64(pgraph.dma_semaphore, NV2AState),
+        VMSTATE_UINT64(pgraph.dma_report, NV2AState),
+        VMSTATE_UINT64(pgraph.report_offset, NV2AState),
+        VMSTATE_UINT64(pgraph.dma_vertex_a, NV2AState),
+        VMSTATE_UINT64(pgraph.dma_vertex_b, NV2AState),
+        VMSTATE_UINT32_2DARRAY(pgraph.program_data, NV2AState, NV2A_MAX_TRANSFORM_PROGRAM_LENGTH, VSH_TOKEN_SIZE),
+        VMSTATE_UINT32_2DARRAY(pgraph.vsh_constants, NV2AState, NV2A_VERTEXSHADER_CONSTANTS, 4),
+        VMSTATE_BOOL_ARRAY(pgraph.vsh_constants_dirty, NV2AState, NV2A_VERTEXSHADER_CONSTANTS),
+        VMSTATE_UINT32_2DARRAY(pgraph.ltctxa, NV2AState, NV2A_LTCTXA_COUNT, 4),
+        VMSTATE_BOOL_ARRAY(pgraph.ltctxa_dirty, NV2AState, NV2A_LTCTXA_COUNT),
+        VMSTATE_UINT32_2DARRAY(pgraph.ltctxb, NV2AState, NV2A_LTCTXB_COUNT, 4),
+        VMSTATE_BOOL_ARRAY(pgraph.ltctxb_dirty, NV2AState, NV2A_LTCTXB_COUNT),
+        VMSTATE_UINT32_2DARRAY(pgraph.ltc1, NV2AState, NV2A_LTC1_COUNT, 4),
+        VMSTATE_BOOL_ARRAY(pgraph.ltc1_dirty, NV2AState, NV2A_LTC1_COUNT),
+        VMSTATE_STRUCT_ARRAY(pgraph.vertex_attributes, NV2AState, NV2A_VERTEXSHADER_ATTRIBUTES, 1, vmstate_nv2a_pgraph_vertex_attributes, VertexAttribute),
+        VMSTATE_UINT32(pgraph.inline_array_length, NV2AState),
+        VMSTATE_UINT32_ARRAY(pgraph.inline_array, NV2AState, NV2A_MAX_BATCH_LENGTH),
+        VMSTATE_UINT32(pgraph.inline_elements_length, NV2AState), // fixme
+        VMSTATE_UINT32_ARRAY(pgraph.inline_elements, NV2AState, NV2A_MAX_BATCH_LENGTH),
+        VMSTATE_UINT32(pgraph.inline_buffer_length, NV2AState), // fixme
+        VMSTATE_UINT32(pgraph.draw_arrays_length, NV2AState), // fixme
+        VMSTATE_UINT32(pgraph.draw_arrays_max_count, NV2AState), // fixme
+        // GLint gl_draw_arrays_start[1000]; // fixme
+        // GLsizei gl_draw_arrays_count[1000]; // fixme
+        VMSTATE_UINT32_ARRAY(pgraph.regs, NV2AState, 0x2000),
+        VMSTATE_UINT32(pmc.pending_interrupts, NV2AState),
+        VMSTATE_UINT32(pmc.enabled_interrupts, NV2AState),
+        VMSTATE_UINT32(pfifo.pending_interrupts, NV2AState),
+        VMSTATE_UINT32(pfifo.enabled_interrupts, NV2AState),
+        VMSTATE_UINT32_ARRAY(pfifo.regs, NV2AState, 0x2000),
+        VMSTATE_UINT32_ARRAY(pvideo.regs, NV2AState, 0x1000),
+        VMSTATE_UINT32(ptimer.pending_interrupts, NV2AState),
+        VMSTATE_UINT32(ptimer.enabled_interrupts, NV2AState),
+        VMSTATE_UINT32(ptimer.numerator, NV2AState),
+        VMSTATE_UINT32(ptimer.denominator, NV2AState),
+        VMSTATE_UINT32(ptimer.alarm_time, NV2AState),
+        VMSTATE_UINT32_ARRAY(pfb.regs, NV2AState, 0x1000),
+        VMSTATE_UINT32(pcrtc.pending_interrupts, NV2AState),
+        VMSTATE_UINT32(pcrtc.enabled_interrupts, NV2AState),
+        VMSTATE_UINT64(pcrtc.start, NV2AState),
+        VMSTATE_UINT32(pramdac.core_clock_coeff, NV2AState),
+        VMSTATE_UINT64(pramdac.core_clock_freq, NV2AState),
+        VMSTATE_UINT32(pramdac.memory_clock_coeff, NV2AState),
+        VMSTATE_UINT32(pramdac.video_clock_coeff, NV2AState),
+        VMSTATE_BOOL(pgraph.waiting_for_flip, NV2AState),
+        VMSTATE_BOOL(pgraph.waiting_for_nop, NV2AState),
+        VMSTATE_BOOL(pgraph.waiting_for_fifo_access, NV2AState),
+        VMSTATE_BOOL(pgraph.waiting_for_context_switch, NV2AState),
+        VMSTATE_END_OF_LIST()
+    },
+};
 
 static void nv2a_class_init(ObjectClass *klass, void *data)
 {
@@ -519,6 +717,8 @@ static void nv2a_class_init(ObjectClass *klass, void *data)
     k->exit      = nv2a_exitfn;
 
     dc->desc = "GeForce NV2A Integrated Graphics";
+    dc->vmsd = &vmstate_nv2a;
+    dc->reset = qdev_nv2a_reset;
 }
 
 static const TypeInfo nv2a_info = {
@@ -543,4 +743,5 @@ void nv2a_init(PCIBus *bus, int devfn, MemoryRegion *ram)
     PCIDevice *dev = pci_create_simple(bus, devfn, "nv2a");
     NV2AState *d = NV2A_DEVICE(dev);
     nv2a_init_memory(d, ram);
+    qemu_add_vm_change_state_handler(nv2a_vm_state_change, d);
 }

@@ -43,6 +43,12 @@
 #include "xemu-shaders.h"
 #include "hw/xbox/nv2a/gl/gloffscreen.h" // FIXME
 
+#include "qemu-common.h"
+#include "qapi/error.h"
+#include "qapi/qapi-commands-block.h"
+#include "qapi/qmp/qdict.h"
+#include "hw/xbox/smbus.h" // For eject, drive tray
+
 // #define DEBUG_XEMU_C
 
 #ifdef DEBUG_XEMU_C
@@ -857,7 +863,6 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
     assert(o->type == DISPLAY_TYPE_XEMU);
     SDL_GL_MakeCurrent(m_window, m_context);
 
-    xemu_input_init();
     xemu_settings_get_enum(XEMU_SETTINGS_DISPLAY_SCALE, &scaling_mode);
 
     memset(&info, 0, sizeof(info));
@@ -1079,9 +1084,11 @@ static void xemu_sdl2_gl_render_surface(struct sdl2_console *scon)
     glDrawElements(GL_TRIANGLE_FAN, 4, GL_UNSIGNED_INT, NULL);
 
     // FIXME: Finer locking
+    qemu_mutex_lock_main_loop();
     qemu_mutex_lock_iothread();
     xemu_hud_render();
     qemu_mutex_unlock_iothread();
+    qemu_mutex_unlock_main_loop();
 
     // xb_surface_gl_render_texture(scon->surface);
     pre_swap();
@@ -1166,6 +1173,7 @@ void sdl2_gl_refresh(DisplayChangeListener *dcl)
 
     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
 
+    qemu_mutex_lock_main_loop();
     qemu_mutex_lock_iothread();
     graphic_hw_update(dcl->con);
 
@@ -1174,6 +1182,7 @@ void sdl2_gl_refresh(DisplayChangeListener *dcl)
     }
     sdl2_poll_events(scon);
     qemu_mutex_unlock_iothread();
+    qemu_mutex_unlock_main_loop();
     xemu_sdl2_gl_render_surface(scon);
 }
 
@@ -1434,9 +1443,34 @@ int main(int argc, char **argv)
 
     DPRINTF("Main thread: waiting for display_init_sem\n");
     qemu_sem_wait(&display_init_sem);
+
     DPRINTF("Main thread: initializing app\n");
 
     while (1) {
         sdl2_gl_refresh(&sdl2_console[0].dcl);
     }
+}
+
+void xemu_eject_disc(void)
+{
+    xbox_smc_eject_button();
+
+    // Xbox software may request that the drive open, but do it now anyway
+    Error *err = NULL;
+    qmp_eject(true, "ide0-cd1", false, NULL, true, false, &err);
+
+    xbox_smc_update_tray_state();
+}
+
+void xemu_load_disc(const char *path)
+{
+    // Ensure an eject sequence is always triggered so Xbox software reloads
+    xbox_smc_eject_button();
+
+    Error *err = NULL;
+    qmp_blockdev_change_medium(true, "ide0-cd1", false, NULL, path,
+                               false, "", false, 0,
+                               &err);
+
+    xbox_smc_update_tray_state();
 }

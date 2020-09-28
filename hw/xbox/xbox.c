@@ -203,8 +203,6 @@ static void xbox_flash_init(MemoryRegion *rom_memory)
         memory_region_add_subregion(rom_memory, map_loc, map_bios);
         memory_region_set_readonly(map_bios, true);
     }
-
-    return;
 }
 
 static void xbox_memory_init(PCMachineState *pcms,
@@ -232,6 +230,7 @@ static void xbox_memory_init(PCMachineState *pcms,
     memory_region_add_subregion(system_memory, 0, ram);
 
     xbox_flash_init(rom_memory);
+    pc_system_flash_cleanup_unused(pcms);
 }
 
 uint8_t *load_eeprom(void)
@@ -375,7 +374,7 @@ void xbox_init_common(MachineState *machine,
 
     i8257_dma_init(isa_bus, 0);
 
-    pcspk_init(isa_bus, pit);
+    pcspk_init(pcms->pcspk, isa_bus, pit);
 
     PCIDevice *dev = pci_create_simple(pci_bus, PCI_DEVFN(9, 0), "piix3-ide");
     pci_ide_create_devs(dev);
@@ -404,22 +403,22 @@ void xbox_init_common(MachineState *machine,
     smbus_adm1032_init(smbus, 0x4c);
 
     /* USB */
-    PCIDevice *usb1 = pci_create(pci_bus, PCI_DEVFN(3, 0), "pci-ohci");
+    PCIDevice *usb1 = pci_new(PCI_DEVFN(3, 0), "pci-ohci");
     qdev_prop_set_uint32(&usb1->qdev, "num-ports", 4);
-    qdev_init_nofail(&usb1->qdev);
+    pci_realize_and_unref(usb1, pci_bus, &error_fatal);
 
-    PCIDevice *usb0 = pci_create(pci_bus, PCI_DEVFN(2, 0), "pci-ohci");
+    PCIDevice *usb0 = pci_new(PCI_DEVFN(2, 0), "pci-ohci");
     qdev_prop_set_uint32(&usb0->qdev, "num-ports", 4);
-    qdev_init_nofail(&usb0->qdev);
+    pci_realize_and_unref(usb0, pci_bus, &error_fatal);
 
     /* Ethernet! */
-    PCIDevice *nvnet = pci_create(pci_bus, PCI_DEVFN(4, 0), "nvnet");
+    PCIDevice *nvnet = pci_new(PCI_DEVFN(4, 0), "nvnet");
 
     for (i = 0; i < nb_nics; i++) {
         NICInfo *nd = &nd_table[i];
         qemu_check_nic_model(nd, "nvnet");
         qdev_set_nic_properties(&nvnet->qdev, nd);
-        qdev_init_nofail(&nvnet->qdev);
+        pci_realize_and_unref(nvnet, pci_bus, &error_fatal);
     }
 
     /* APU! */
@@ -531,28 +530,27 @@ static bool machine_get_short_animation(Object *obj, Error **errp)
 static inline void xbox_machine_initfn(Object *obj)
 {
     object_property_add_str(obj, "bootrom", machine_get_bootrom,
-                            machine_set_bootrom, NULL);
+                            machine_set_bootrom);
     object_property_set_description(obj, "bootrom",
-                                    "Xbox bootrom file", NULL);
+                                    "Xbox bootrom file");
 
     object_property_add_str(obj, "eeprom", machine_get_eeprom,
-                            machine_set_eeprom, NULL);
+                            machine_set_eeprom);
     object_property_set_description(obj, "eeprom",
-                                    "Xbox EEPROM file", NULL);
+                                    "Xbox EEPROM file");
 
     object_property_add_str(obj, "avpack", machine_get_avpack,
-                            machine_set_avpack, NULL);
+                            machine_set_avpack);
     object_property_set_description(obj, "avpack",
-                                    "Xbox video connector: composite (default), scart, svideo, vga, rfu, hdtv, none", NULL);
-    object_property_set_str(obj, "composite", "avpack", NULL);
+                                    "Xbox video connector: composite (default), scart, svideo, vga, rfu, hdtv, none");
+    object_property_set_str(obj, "avpack", "composite", &error_fatal);
 
     object_property_add_bool(obj, "short-animation",
                              machine_get_short_animation,
-                             machine_set_short_animation, NULL);
+                             machine_set_short_animation);
     object_property_set_description(obj, "short-animation",
-                                    "Skip Xbox boot animation",
-                                    NULL);
-    object_property_set_bool(obj, false, "short-animation", NULL);
+                                    "Skip Xbox boot animation");
+    object_property_set_bool(obj, "short-animation", false, &error_fatal);
 
 }
 

@@ -3,7 +3,7 @@
  *
  * Copyright (c) 2012 espes
  * Copyright (c) 2015 Jannik Vogel
- * Copyright (c) 2018 Matt Borgerson
+ * Copyright (c) 2018-2020 Matt Borgerson
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -387,12 +387,20 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 
     reg_log_write(NV_PGRAPH, addr, val);
 
+    qemu_mutex_lock(&d->pfifo.lock); // FIXME: Factor out fifo lock here
     qemu_mutex_lock(&pg->lock);
 
     switch (addr) {
     case NV_PGRAPH_INTR:
         pg->pending_interrupts &= ~val;
-        qemu_cond_broadcast(&pg->interrupt_cond);
+
+        if (!(pg->pending_interrupts & NV_PGRAPH_INTR_ERROR)) {
+            pg->waiting_for_nop = false;
+        }
+        if (!(pg->pending_interrupts & NV_PGRAPH_INTR_CONTEXT_SWITCH)) {
+            pg->waiting_for_context_switch = false;
+        }
+        pfifo_kick(d);
         break;
     case NV_PGRAPH_INTR_EN:
         pg->enabled_interrupts = val;
@@ -405,7 +413,7 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
                               NV_PGRAPH_SURFACE_READ_3D)+1)
                         % GET_MASK(pg->regs[NV_PGRAPH_SURFACE],
                                    NV_PGRAPH_SURFACE_MODULO_3D) );
-            qemu_cond_broadcast(&pg->flip_3d);
+            pfifo_kick(d);
         }
         break;
     case NV_PGRAPH_RDI_DATA: {
@@ -459,11 +467,49 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
     // events
     switch (addr) {
     case NV_PGRAPH_FIFO:
-        qemu_cond_broadcast(&pg->fifo_access_cond);
+        pfifo_kick(d);
         break;
     }
 
     qemu_mutex_unlock(&pg->lock);
+    qemu_mutex_unlock(&d->pfifo.lock);
+}
+
+static void pgraph_flush(NV2AState *d)
+{
+    PGRAPHState *pg = &d->pgraph;
+
+    // Clear last surface shape to force recreation of buffers at next draw
+    pg->surface_color.draw_dirty = false;
+    pg->surface_zeta.draw_dirty = false;
+    memset(&pg->last_surface_shape, 0, sizeof(pg->last_surface_shape));
+
+    // Sync all RAM
+    glBindBuffer(GL_ARRAY_BUFFER, d->pgraph.gl_memory_buffer);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, memory_region_size(d->vram), d->vram_ptr);
+
+    // FIXME: Flush more?
+}
+
+/* If NV097_FLIP_STALL was executed, check if the flip has completed.
+ * This will usually happen in the VSYNC interrupt handler.
+ */
+static int pgraph_is_flip_stall_complete(NV2AState *d)
+{
+    PGRAPHState *pg = &d->pgraph;
+ 
+    NV2A_DPRINTF("flip stall read: %d, write: %d, modulo: %d\n",
+        GET_MASK(pg->regs[NV_PGRAPH_SURFACE], NV_PGRAPH_SURFACE_READ_3D),
+        GET_MASK(pg->regs[NV_PGRAPH_SURFACE], NV_PGRAPH_SURFACE_WRITE_3D),
+        GET_MASK(pg->regs[NV_PGRAPH_SURFACE], NV_PGRAPH_SURFACE_MODULO_3D));
+
+    uint32_t s = pg->regs[NV_PGRAPH_SURFACE];
+    if (GET_MASK(s, NV_PGRAPH_SURFACE_READ_3D)
+        != GET_MASK(s, NV_PGRAPH_SURFACE_WRITE_3D)) {
+        return 1;
+    }
+
+    return 0;
 }
 
 static void pgraph_method(NV2AState *d,
@@ -475,6 +521,11 @@ static void pgraph_method(NV2AState *d,
     unsigned int slot;
 
     PGRAPHState *pg = &d->pgraph;
+
+    if (pg->flush_pending) {
+        pgraph_flush(d);
+        pg->flush_pending = false;
+    }
 
     bool channel_valid =
         d->pgraph.regs[NV_PGRAPH_CTX_CONTROL] & NV_PGRAPH_CTX_CONTROL_CHID;
@@ -669,23 +720,19 @@ static void pgraph_method(NV2AState *d,
             pg->regs[NV_PGRAPH_TRAPPED_DATA_LOW] = parameter;
             pg->regs[NV_PGRAPH_NSOURCE] = NV_PGRAPH_NSOURCE_NOTIFICATION; /* TODO: check this */
             pg->pending_interrupts |= NV_PGRAPH_INTR_ERROR;
+            pg->waiting_for_nop = true;
 
             qemu_mutex_unlock(&pg->lock);
             qemu_mutex_lock_iothread();
             update_irq(d);
-            qemu_mutex_lock(&pg->lock);
             qemu_mutex_unlock_iothread();
-
-            while (pg->pending_interrupts & NV_PGRAPH_INTR_ERROR) {
-                qemu_cond_wait(&pg->interrupt_cond, &pg->lock);
-            }
+            qemu_mutex_lock(&pg->lock);
         }
         break;
 
     case NV097_WAIT_FOR_IDLE:
         pgraph_update_surface(d, false, true, true);
         break;
-
 
     case NV097_SET_FLIP_READ:
         SET_MASK(pg->regs[NV_PGRAPH_SURFACE], NV_PGRAPH_SURFACE_READ_3D,
@@ -719,21 +766,7 @@ static void pgraph_method(NV2AState *d,
     }
     case NV097_FLIP_STALL:
         pgraph_update_surface(d, false, true, true);
-
-        while (true) {
-            NV2A_DPRINTF("flip stall read: %d, write: %d, modulo: %d\n",
-                GET_MASK(pg->regs[NV_PGRAPH_SURFACE], NV_PGRAPH_SURFACE_READ_3D),
-                GET_MASK(pg->regs[NV_PGRAPH_SURFACE], NV_PGRAPH_SURFACE_WRITE_3D),
-                GET_MASK(pg->regs[NV_PGRAPH_SURFACE], NV_PGRAPH_SURFACE_MODULO_3D));
-
-            uint32_t s = pg->regs[NV_PGRAPH_SURFACE];
-            if (GET_MASK(s, NV_PGRAPH_SURFACE_READ_3D)
-                != GET_MASK(s, NV_PGRAPH_SURFACE_WRITE_3D)) {
-                break;
-            }
-            qemu_cond_wait(&pg->flip_3d, &pg->lock);
-        }
-        NV2A_DPRINTF("flip stall done\n");
+        pg->waiting_for_flip = true;
         break;
 
     // TODO: these should be loading the dma objects from ramin here?
@@ -865,7 +898,12 @@ static void pgraph_method(NV2AState *d,
                  z_perspective);
         break;
     }
-
+    case NV097_SET_COLOR_MATERIAL:
+        SET_MASK(pg->regs[NV_PGRAPH_CSV0_C], NV_PGRAPH_CSV0_C_EMISSION, (parameter >> 0) & 3);
+        SET_MASK(pg->regs[NV_PGRAPH_CSV0_C], NV_PGRAPH_CSV0_C_AMBIENT,  (parameter >> 2) & 3);
+        SET_MASK(pg->regs[NV_PGRAPH_CSV0_C], NV_PGRAPH_CSV0_C_DIFFUSE,  (parameter >> 4) & 3);
+        SET_MASK(pg->regs[NV_PGRAPH_CSV0_C], NV_PGRAPH_CSV0_C_SPECULAR, (parameter >> 6) & 3);
+        break;
     case NV097_SET_FOG_MODE: {
         /* FIXME: There is also NV_PGRAPH_CSV0_D_FOG_MODE */
         unsigned int mode;
@@ -1234,6 +1272,14 @@ static void pgraph_method(NV2AState *d,
         SET_MASK(pg->regs[NV_PGRAPH_CSV0_C],
                  NV_PGRAPH_CSV0_C_NORMALIZATION_ENABLE,
                  parameter);
+        break;
+
+    case NV097_SET_MATERIAL_EMISSION ...
+            NV097_SET_MATERIAL_EMISSION + 8:
+        slot = (method - NV097_SET_MATERIAL_EMISSION) / 4;
+        // FIXME: Verify NV_IGRAPH_XF_LTCTXA_CM_COL is correct
+        pg->ltctxa[NV_IGRAPH_XF_LTCTXA_CM_COL][slot] = parameter;
+        pg->ltctxa_dirty[NV_IGRAPH_XF_LTCTXA_CM_COL] = true;
         break;
 
     case NV097_SET_LIGHT_ENABLE_MASK:
@@ -1866,7 +1912,7 @@ static void pgraph_method(NV2AState *d,
 
             } else {
                 NV2A_GL_DPRINTF(true, "EMPTY NV097_SET_BEGIN_END");
-                assert(false);
+                NV2A_UNCONFIRMED("EMPTY NV097_SET_BEGIN_END");
             }
 
             /* End of visibility testing */
@@ -2595,25 +2641,18 @@ static void pgraph_context_switch(NV2AState *d, unsigned int channel_id)
         assert(!(d->pgraph.regs[NV_PGRAPH_DEBUG_3]
                 & NV_PGRAPH_DEBUG_3_HW_CONTEXT_SWITCH));
 
+        d->pgraph.waiting_for_context_switch = true;
         qemu_mutex_unlock(&d->pgraph.lock);
         qemu_mutex_lock_iothread();
         d->pgraph.pending_interrupts |= NV_PGRAPH_INTR_CONTEXT_SWITCH;
         update_irq(d);
-
-        qemu_mutex_lock(&d->pgraph.lock);
         qemu_mutex_unlock_iothread();
-
-        // wait for the interrupt to be serviced
-        while (d->pgraph.pending_interrupts & NV_PGRAPH_INTR_CONTEXT_SWITCH) {
-            qemu_cond_wait(&d->pgraph.interrupt_cond, &d->pgraph.lock);
-        }
+        qemu_mutex_lock(&d->pgraph.lock);
     }
 }
 
-static void pgraph_wait_fifo_access(NV2AState *d) {
-    while (!(d->pgraph.regs[NV_PGRAPH_FIFO] & NV_PGRAPH_FIFO_ACCESS)) {
-        qemu_cond_wait(&d->pgraph.fifo_access_cond, &d->pgraph.lock);
-    }
+static int pgraph_can_fifo_access(NV2AState *d) {
+    return !!(d->pgraph.regs[NV_PGRAPH_FIFO] & NV_PGRAPH_FIFO_ACCESS);
 }
 
 // static const char* nv2a_method_names[] = {};
@@ -2706,9 +2745,6 @@ static void pgraph_init(NV2AState *d)
     PGRAPHState *pg = &d->pgraph;
 
     qemu_mutex_init(&pg->lock);
-    qemu_cond_init(&pg->interrupt_cond);
-    qemu_cond_init(&pg->fifo_access_cond);
-    qemu_cond_init(&pg->flip_3d);
 
     /* fire up opengl */
 
@@ -2785,9 +2821,6 @@ static void pgraph_init(NV2AState *d)
 static void pgraph_destroy(PGRAPHState *pg)
 {
     qemu_mutex_destroy(&pg->lock);
-    qemu_cond_destroy(&pg->interrupt_cond);
-    qemu_cond_destroy(&pg->fifo_access_cond);
-    qemu_cond_destroy(&pg->flip_3d);
 
     glo_set_current(pg->gl_context);
 
@@ -3038,6 +3071,12 @@ static void pgraph_bind_shaders(PGRAPHState *pg)
                              NV_PGRAPH_CSV0_C_LIGHTING),
         .normalization = pg->regs[NV_PGRAPH_CSV0_C]
                            & NV_PGRAPH_CSV0_C_NORMALIZATION_ENABLE,
+
+        /* color material */
+        .emission_src = (enum MaterialColorSource)GET_MASK(pg->regs[NV_PGRAPH_CSV0_C], NV_PGRAPH_CSV0_C_EMISSION),
+        .ambient_src = (enum MaterialColorSource)GET_MASK(pg->regs[NV_PGRAPH_CSV0_C], NV_PGRAPH_CSV0_C_AMBIENT),
+        .diffuse_src = (enum MaterialColorSource)GET_MASK(pg->regs[NV_PGRAPH_CSV0_C], NV_PGRAPH_CSV0_C_DIFFUSE),
+        .specular_src = (enum MaterialColorSource)GET_MASK(pg->regs[NV_PGRAPH_CSV0_C], NV_PGRAPH_CSV0_C_SPECULAR),
 
         .fixed_function = fixed_function,
 
@@ -3650,10 +3689,10 @@ static void pgraph_bind_textures(NV2AState *d)
         }
 
         /* Check for unsupported features */
-        assert(!(filter & NV_PGRAPH_TEXFILTER0_ASIGNED));
-        assert(!(filter & NV_PGRAPH_TEXFILTER0_RSIGNED));
-        assert(!(filter & NV_PGRAPH_TEXFILTER0_GSIGNED));
-        assert(!(filter & NV_PGRAPH_TEXFILTER0_BSIGNED));
+        if (filter & NV_PGRAPH_TEXFILTER0_ASIGNED) NV2A_UNIMPLEMENTED("NV_PGRAPH_TEXFILTER0_ASIGNED");
+        if (filter & NV_PGRAPH_TEXFILTER0_RSIGNED) NV2A_UNIMPLEMENTED("NV_PGRAPH_TEXFILTER0_RSIGNED");
+        if (filter & NV_PGRAPH_TEXFILTER0_GSIGNED) NV2A_UNIMPLEMENTED("NV_PGRAPH_TEXFILTER0_GSIGNED");
+        if (filter & NV_PGRAPH_TEXFILTER0_BSIGNED) NV2A_UNIMPLEMENTED("NV_PGRAPH_TEXFILTER0_BSIGNED");
 
         glActiveTexture(GL_TEXTURE0 + i);
         if (!enabled) {
@@ -3802,6 +3841,7 @@ static void pgraph_bind_textures(NV2AState *d)
                 }
                 if (cubemap) {
                     assert(dimensionality == 2);
+                    length = (length + NV2A_CUBEMAP_FACE_ALIGNMENT - 1) & ~(NV2A_CUBEMAP_FACE_ALIGNMENT - 1);
                     length *= 6;
                 }
                 if (dimensionality >= 3) {
@@ -4394,15 +4434,29 @@ static TextureBinding* generate_texture(const TextureShape s,
 
     if (gl_target == GL_TEXTURE_CUBE_MAP) {
 
+        ColorFormatInfo f = kelvin_color_format_map[s.color_format];
+        unsigned int block_size;
+        if (f.gl_internal_format == GL_COMPRESSED_RGBA_S3TC_DXT1_EXT) {
+            block_size = 8;
+        } else {
+            block_size = 16;
+        }
+
         size_t length = 0;
         unsigned int w = s.width, h = s.height;
         int level;
         for (level = 0; level < s.levels; level++) {
-            /* FIXME: This is wrong for compressed textures and textures with 1x? non-square mipmaps */
-            length += w * h * f.bytes_per_pixel;
+            if (f.gl_format == 0) {
+                length += w/4 * h/4 * block_size;
+            } else {
+                length += w * h * f.bytes_per_pixel;
+            }
+
             w /= 2;
             h /= 2;
         }
+
+        length = (length + NV2A_CUBEMAP_FACE_ALIGNMENT - 1) & ~(NV2A_CUBEMAP_FACE_ALIGNMENT - 1);
 
         upload_gl_texture(GL_TEXTURE_CUBE_MAP_POSITIVE_X,
                           s, texture_data + 0 * length, palette_data);

@@ -2,7 +2,7 @@
  * QEMU nForce Ethernet Controller implementation
  *
  * Copyright (c) 2013 espes
- * Copyright (c) 2015-2018 Matt Borgerson
+ * Copyright (c) 2015-2020 Matt Borgerson
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -25,6 +25,7 @@
 #include "hw/qdev-properties.h"
 #include "net/net.h"
 #include "qemu/iov.h"
+#include "migration/vmstate.h"
 
 #define IOPORT_SIZE 0x8
 #define MMIO_SIZE   0x400
@@ -239,6 +240,7 @@ enum {
 #define RX_NIC_BUFSIZE        (DEFAULT_MTU + 64)
 /* even more slack */
 #define RX_ALLOC_BUFSIZE      (DEFAULT_MTU + 128)
+#define TX_ALLOC_BUFSIZE      (DEFAULT_MTU + 128)
 
 #define OOM_REFILL            (1 + HZ / 20)
 #define POLL_WAIT             (1 + HZ / 100)
@@ -271,26 +273,35 @@ enum {
  ******************************************************************************/
 
 typedef struct NvNetState {
-    PCIDevice    dev;
+    /*< private >*/
+    PCIDevice parent_obj;
+    /*< public >*/
+
     NICState     *nic;
     NICConf      conf;
     MemoryRegion mmio, io;
-    uint8_t      regs[MMIO_SIZE / 4];
+
+    uint8_t      regs[MMIO_SIZE];
     uint32_t     phy_regs[6];
     uint8_t      tx_ring_index;
     uint8_t      tx_ring_size;
     uint8_t      rx_ring_index;
     uint8_t      rx_ring_size;
-    uint8_t      txrx_dma_buf[RX_ALLOC_BUFSIZE];
+    uint8_t      tx_dma_buf[TX_ALLOC_BUFSIZE];
+    uint32_t     tx_dma_buf_offset;
+    uint8_t      rx_dma_buf[RX_ALLOC_BUFSIZE];
+
     FILE         *packet_dump_file;
     char         *packet_dump_path;
 } NvNetState;
 
+#pragma pack(1)
 struct RingDesc {
     uint32_t packet_buffer;
     uint16_t length;
     uint16_t flags;
 };
+#pragma pack()
 
 /*******************************************************************************
  * Helper Macros
@@ -354,6 +365,7 @@ static void nvnet_hex_dump(NvNetState *s, const uint8_t *buf, int size);
 #ifdef DEBUG
 static const char *nvnet_get_reg_name(hwaddr addr);
 static const char *nvnet_get_mii_reg_name(uint8_t reg);
+static void nvnet_dump_ring_descriptors(NvNetState *s);
 #endif
 
 /*******************************************************************************
@@ -365,12 +377,16 @@ static const char *nvnet_get_mii_reg_name(uint8_t reg);
  */
 static void nvnet_update_irq(NvNetState *s)
 {
-    if (nvnet_get_reg(s, NvRegIrqMask,   4) &&
-        nvnet_get_reg(s, NvRegIrqStatus, 4)) {
+    PCIDevice *d = PCI_DEVICE(s);
+
+    uint32_t irq_mask = nvnet_get_reg(s, NvRegIrqMask, 4);
+    uint32_t irq_status = nvnet_get_reg(s, NvRegIrqStatus, 4);
+
+    if (irq_mask & irq_status) {
         NVNET_DPRINTF("Asserting IRQ\n");
-        pci_irq_assert(&s->dev);
+        pci_irq_assert(d);
     } else {
-        pci_irq_deassert(&s->dev);
+        pci_irq_deassert(d);
     }
 }
 
@@ -383,6 +399,8 @@ static void nvnet_update_irq(NvNetState *s)
  */
 static uint32_t nvnet_get_reg(NvNetState *s, hwaddr addr, unsigned int size)
 {
+    assert(addr < MMIO_SIZE);
+
     switch (size) {
     case 4:
         assert((addr & 3) == 0); /* Unaligned register access. */
@@ -406,6 +424,8 @@ static uint32_t nvnet_get_reg(NvNetState *s, hwaddr addr, unsigned int size)
 static void nvnet_set_reg(NvNetState *s,
                           hwaddr addr, uint32_t val, unsigned int size)
 {
+    assert(addr < MMIO_SIZE);
+
     switch (size) {
     case 4:
         assert((addr & 3) == 0); /* Unaligned register access. */
@@ -545,6 +565,9 @@ static void nvnet_mmio_write(void *opaque, hwaddr addr,
     case NvRegTxRxControl:
         if (val == NVREG_TXRXCTL_KICK) {
             NVNET_DPRINTF("NvRegTxRxControl = NVREG_TXRXCTL_KICK!\n");
+#ifdef DEBUG
+            nvnet_dump_ring_descriptors(s);
+#endif
             nvnet_dma_packet_from_guest(s);
         }
 
@@ -553,7 +576,14 @@ static void nvnet_mmio_write(void *opaque, hwaddr addr,
             break;
         }
 
+        if (val & NVREG_TXRXCTL_RESET) {
+            s->tx_ring_index = 0;
+            s->rx_ring_index = 0;
+            s->tx_dma_buf_offset = 0;
+        }
+
         if (val & NVREG_TXRXCTL_BIT1) {
+            // FIXME
             nvnet_set_reg(s, NvRegIrqStatus, 0, 4);
             break;
         } else if (val == 0) {
@@ -629,108 +659,141 @@ static ssize_t nvnet_receive_iov(NetClientState *nc,
 
     NVNET_DPRINTF("nvnet: Packet received!\n");
 
-    if (size > sizeof(s->txrx_dma_buf)) {
+    if (size > sizeof(s->rx_dma_buf)) {
         NVNET_DPRINTF("nvnet_receive_iov packet too large!\n");
         assert(0);
         return -1;
     }
 
-    iov_to_buf(iov, iovcnt, 0, s->txrx_dma_buf, size);
-    nvnet_hex_dump(s, s->txrx_dma_buf, size);
-    return nvnet_dma_packet_to_guest(s, s->txrx_dma_buf, size);
+    iov_to_buf(iov, iovcnt, 0, s->rx_dma_buf, size);
+#ifdef DEBUG
+    nvnet_hex_dump(s, s->rx_dma_buf, size);
+#endif
+    return nvnet_dma_packet_to_guest(s, s->rx_dma_buf, size);
 }
+
 
 static ssize_t nvnet_dma_packet_to_guest(NvNetState *s,
                                          const uint8_t *buf, size_t size)
 {
+    PCIDevice *d = PCI_DEVICE(s);
     struct RingDesc desc;
     int i;
+    bool did_receive = false;
+
+    nvnet_set_reg(s, NvRegTxRxControl,
+        nvnet_get_reg(s, NvRegTxRxControl, 4) & ~NVREG_TXRXCTL_IDLE,
+        4);
 
     for (i = 0; i < s->rx_ring_size; i++) {
         /* Read current ring descriptor */
         s->rx_ring_index %= s->rx_ring_size;
         dma_addr_t rx_ring_addr = nvnet_get_reg(s, NvRegRxRingPhysAddr, 4);
         rx_ring_addr += s->rx_ring_index * sizeof(desc);
-        pci_dma_read(&s->dev, rx_ring_addr, &desc, sizeof(desc));
-        NVNET_DPRINTF("Looking at ring descriptor %d (0x%llx): ",
+        pci_dma_read(d, rx_ring_addr, &desc, sizeof(desc));
+        NVNET_DPRINTF("RX: Looking at ring descriptor %d (0x%llx): ",
                       s->rx_ring_index, rx_ring_addr);
         NVNET_DPRINTF("Buffer: 0x%x, ", desc.packet_buffer);
         NVNET_DPRINTF("Length: 0x%x, ", desc.length);
         NVNET_DPRINTF("Flags: 0x%x\n", desc.flags);
 
-        s->rx_ring_index += 1;
-
-        if (!(desc.flags & NV_RX_AVAIL) || !(desc.length >= size)) {
-            continue;
+        if (!(desc.flags & NV_RX_AVAIL)) {
+            break;
         }
+
+        assert((desc.length+1) >= size); // FIXME
+
+        s->rx_ring_index += 1;
 
         /* Transfer packet from device to memory */
         NVNET_DPRINTF("Transferring packet, size 0x%zx, to memory at 0x%x\n",
                       size, desc.packet_buffer);
-        pci_dma_write(&s->dev, desc.packet_buffer, buf, size);
+        pci_dma_write(d, desc.packet_buffer, buf, size);
 
         /* Update descriptor indicating the packet is waiting */
         desc.length = size;
         desc.flags  = NV_RX_BIT4 | NV_RX_DESCRIPTORVALID;
-        pci_dma_write(&s->dev, rx_ring_addr, &desc, sizeof(desc));
+        pci_dma_write(d, rx_ring_addr, &desc, sizeof(desc));
         NVNET_DPRINTF("Updated ring descriptor: ");
         NVNET_DPRINTF("Length: 0x%x, ", desc.length);
         NVNET_DPRINTF("Flags: 0x%x\n", desc.flags);
 
         /* Trigger interrupt */
         NVNET_DPRINTF("Triggering interrupt\n");
-        nvnet_set_reg(s, NvRegIrqStatus, NVREG_IRQSTAT_BIT1, 4);
+        uint32_t irq_status = nvnet_get_reg(s, NvRegIrqStatus, 4);
+        nvnet_set_reg(s, NvRegIrqStatus, irq_status | NVREG_IRQSTAT_BIT1, 4);
         nvnet_update_irq(s);
-        return size;
+        did_receive = true;
+        break;
     }
 
-    /* Could not find free buffer, or packet too large. */
-    NVNET_DPRINTF("Could not find free buffer!\n");
-    return -1;
+    nvnet_set_reg(s, NvRegTxRxControl,
+        nvnet_get_reg(s, NvRegTxRxControl, 4) | NVREG_TXRXCTL_IDLE,
+        4);
+
+    if (did_receive) {
+        return size;
+    } else {
+        /* Could not find free buffer, or packet too large. */
+        NVNET_DPRINTF("Could not find free buffer!\n");
+        return -1;
+    }
 }
 
 static ssize_t nvnet_dma_packet_from_guest(NvNetState *s)
 {
+    PCIDevice *d = PCI_DEVICE(s);
     struct RingDesc desc;
     bool is_last_packet;
-    int i;
     bool packet_sent = false;
+    int i;
+
+    nvnet_set_reg(s, NvRegTxRxControl,
+        nvnet_get_reg(s, NvRegTxRxControl, 4) & ~NVREG_TXRXCTL_IDLE,
+        4);
 
     for (i = 0; i < s->tx_ring_size; i++) {
         /* Read ring descriptor */
         s->tx_ring_index %= s->tx_ring_size;
         dma_addr_t tx_ring_addr = nvnet_get_reg(s, NvRegTxRingPhysAddr, 4);
         tx_ring_addr += s->tx_ring_index * sizeof(desc);
-        pci_dma_read(&s->dev, tx_ring_addr, &desc, sizeof(desc));
-        NVNET_DPRINTF("Looking at ring desc %d (%llx): ",
+        pci_dma_read(d, tx_ring_addr, &desc, sizeof(desc));
+        NVNET_DPRINTF("TX: Looking at ring desc %d (%llx): ",
                       s->tx_ring_index, tx_ring_addr);
         NVNET_DPRINTF("Buffer: 0x%x, ", desc.packet_buffer);
         NVNET_DPRINTF("Length: 0x%x, ", desc.length);
         NVNET_DPRINTF("Flags: 0x%x\n", desc.flags);
 
-        s->tx_ring_index += 1;
-
         if (!(desc.flags & NV_TX_VALID)) {
-            continue;
+            break;
         }
 
+        s->tx_ring_index += 1;
+
         /* Transfer packet from guest memory */
-        NVNET_DPRINTF("Sending packet...\n");
-        pci_dma_read(&s->dev, desc.packet_buffer,
-                              s->txrx_dma_buf, desc.length + 1);
-        nvnet_send_packet(s, s->txrx_dma_buf, desc.length + 1);
-        packet_sent = true;
+        assert((s->tx_dma_buf_offset + desc.length + 1) <= sizeof(s->tx_dma_buf));
+        pci_dma_read(d, desc.packet_buffer,
+                     &s->tx_dma_buf[s->tx_dma_buf_offset],
+                     desc.length + 1);
+        s->tx_dma_buf_offset += desc.length + 1;
 
         /* Update descriptor */
         is_last_packet = desc.flags & NV_TX_LASTPACKET;
+        if (is_last_packet) {
+            NVNET_DPRINTF("Sending packet...\n");
+            nvnet_send_packet(s, s->tx_dma_buf, s->tx_dma_buf_offset);
+            s->tx_dma_buf_offset = 0;
+            packet_sent = true;
+        }
+
         desc.flags &= ~(NV_TX_VALID | NV_TX_RETRYERROR | NV_TX_DEFERRED |
             NV_TX_CARRIERLOST | NV_TX_LATECOLLISION | NV_TX_UNDERFLOW |
             NV_TX_ERROR);
         desc.length = desc.length + 5;
-        pci_dma_write(&s->dev, tx_ring_addr, &desc, sizeof(desc));
+        pci_dma_write(d, tx_ring_addr, &desc, sizeof(desc));
 
         if (is_last_packet) {
-            NVNET_DPRINTF("  -- Last packet\n");
+            // FIXME
             break;
         }
     }
@@ -738,9 +801,14 @@ static ssize_t nvnet_dma_packet_from_guest(NvNetState *s)
     /* Trigger interrupt */
     if (packet_sent) {
         NVNET_DPRINTF("Triggering interrupt\n");
-        nvnet_set_reg(s, NvRegIrqStatus, NVREG_IRQSTAT_BIT4, 4);
+        uint32_t irq_status = nvnet_get_reg(s, NvRegIrqStatus, 4);
+        nvnet_set_reg(s, NvRegIrqStatus, irq_status | NVREG_IRQSTAT_BIT4, 4);
         nvnet_update_irq(s);
     }
+
+    nvnet_set_reg(s, NvRegTxRxControl,
+        nvnet_get_reg(s, NvRegTxRxControl, 4) | NVREG_TXRXCTL_IDLE,
+        4);
 
     return 0;
 }
@@ -798,6 +866,7 @@ static void nvnet_realize(PCIDevice *pci_dev, Error **errp)
 {
     DeviceState *dev = DEVICE(pci_dev);
     NvNetState *s = NVNET_DEVICE(pci_dev);
+    PCIDevice *d = PCI_DEVICE(s);
 
     pci_dev->config[PCI_INTERRUPT_PIN] = 0x01;
 
@@ -820,11 +889,11 @@ static void nvnet_realize(PCIDevice *pci_dev, Error **errp)
 
     memory_region_init_io(&s->mmio, OBJECT(dev), &nvnet_mmio_ops, s,
         "nvnet-mmio", MMIO_SIZE);
-    pci_register_bar(&s->dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
+    pci_register_bar(d, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
 
     memory_region_init_io(&s->io, OBJECT(dev), &nvnet_io_ops, s,
         "nvnet-io", IOPORT_SIZE);
-    pci_register_bar(&s->dev, 1, PCI_BASE_ADDRESS_SPACE_IO, &s->io);
+    pci_register_bar(d, 1, PCI_BASE_ADDRESS_SPACE_IO, &s->io);
 
     qemu_macaddr_default_if_unset(&s->conf.macaddr);
     s->nic = qemu_new_nic(&net_nvnet_info, &s->conf,
@@ -856,6 +925,16 @@ static void nvnet_reset(void *opaque)
     if (qemu_get_queue(s->nic)->link_down) {
         nvnet_link_down(s);
     }
+
+    memset(&s->regs, 0, sizeof(s->regs));
+    memset(&s->phy_regs, 0, sizeof(s->phy_regs));
+    s->tx_ring_index = 0;
+    s->tx_ring_size = 0;
+    s->rx_ring_index = 0;
+    s->rx_ring_size = 0;
+    memset(&s->tx_dma_buf, 0, sizeof(s->tx_dma_buf));
+    s->tx_dma_buf_offset = 0;
+    memset(&s->rx_dma_buf, 0, sizeof(s->rx_dma_buf));
 }
 
 static void qdev_nvnet_reset(DeviceState *dev)
@@ -958,10 +1037,7 @@ static const char *nvnet_get_reg_name(hwaddr addr)
     default:                         return "Unknown";
     }
 }
-#endif
 
-
-#ifdef DEBUG
 /*
  * Get PHY register name.
  */
@@ -977,11 +1053,60 @@ static const char *nvnet_get_mii_reg_name(uint8_t reg)
     default:            return "Unknown";
     }
 }
+
+static void nvnet_dump_ring_descriptors(NvNetState *s)
+{
+    struct RingDesc desc;
+    PCIDevice *d = PCI_DEVICE(s);
+
+    NVNET_DPRINTF("------------------------------------------------\n");
+    for (int i = 0; i < s->tx_ring_size; i++) {
+        /* Read ring descriptor */
+        dma_addr_t tx_ring_addr = nvnet_get_reg(s, NvRegTxRingPhysAddr, 4);
+        tx_ring_addr += i * sizeof(desc);
+        pci_dma_read(d, tx_ring_addr, &desc, sizeof(desc));
+        NVNET_DPRINTF("TX: Dumping ring desc %d (%llx): ",
+                      i, tx_ring_addr);
+        NVNET_DPRINTF("Buffer: 0x%x, ", desc.packet_buffer);
+        NVNET_DPRINTF("Length: 0x%x, ", desc.length);
+        NVNET_DPRINTF("Flags: 0x%x\n", desc.flags);
+    }
+    NVNET_DPRINTF("------------------------------------------------\n");
+
+    for (int i = 0; i < s->rx_ring_size; i++) {
+        /* Read ring descriptor */
+        dma_addr_t rx_ring_addr = nvnet_get_reg(s, NvRegRxRingPhysAddr, 4);
+        rx_ring_addr += i * sizeof(desc);
+        pci_dma_read(d, rx_ring_addr, &desc, sizeof(desc));
+        NVNET_DPRINTF("RX: Dumping ring desc %d (%llx): ",
+                      i, rx_ring_addr);
+        NVNET_DPRINTF("Buffer: 0x%x, ", desc.packet_buffer);
+        NVNET_DPRINTF("Length: 0x%x, ", desc.length);
+        NVNET_DPRINTF("Flags: 0x%x\n", desc.flags);
+    }
+    NVNET_DPRINTF("------------------------------------------------\n");
+}
 #endif
 
 /*******************************************************************************
  * Properties
  ******************************************************************************/
+
+static const VMStateDescription vmstate_nvnet = {
+    .name = "nvnet",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_PCI_DEVICE(parent_obj, NvNetState),
+        VMSTATE_UINT8_ARRAY(regs, NvNetState, MMIO_SIZE),
+        VMSTATE_UINT32_ARRAY(phy_regs, NvNetState, 6),
+        VMSTATE_UINT8(tx_ring_index, NvNetState),
+        VMSTATE_UINT8(tx_ring_size, NvNetState),
+        VMSTATE_UINT8(rx_ring_index, NvNetState),
+        VMSTATE_UINT8(rx_ring_size, NvNetState),
+        VMSTATE_END_OF_LIST()
+    },
+};
 
 static void nvnet_class_init(ObjectClass *klass, void *data)
 {
@@ -990,13 +1115,15 @@ static void nvnet_class_init(ObjectClass *klass, void *data)
 
     k->vendor_id = PCI_VENDOR_ID_NVIDIA;
     k->device_id = PCI_DEVICE_ID_NVIDIA_NVENET_1;
-    k->revision  = 210;
-    k->class_id  = PCI_CLASS_NETWORK_ETHERNET;
-    k->realize   = nvnet_realize;
-    k->exit      = nvnet_uninit;
+    k->revision = 210;
+    k->class_id = PCI_CLASS_NETWORK_ETHERNET;
+    k->realize = nvnet_realize;
+    k->exit = nvnet_uninit;
 
-    dc->desc  = "nForce Ethernet Controller";
+    set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
+    dc->desc = "nForce Ethernet Controller";
     dc->reset = qdev_nvnet_reset;
+    dc->vmsd = &vmstate_nvnet;
     device_class_set_props(dc, nvnet_properties);
 }
 

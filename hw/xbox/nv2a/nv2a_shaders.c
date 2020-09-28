@@ -3,6 +3,7 @@
  *
  * Copyright (c) 2015 espes
  * Copyright (c) 2015 Jannik Vogel
+ * Copyright (c) 2020 Matt Borgerson
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -20,7 +21,6 @@
 
 #include "qemu/osdep.h"
 #include "qemu-common.h"
-#include "nv2a_debug.h"
 #include "nv2a_shaders_common.h"
 #include "nv2a_shaders.h"
 
@@ -365,6 +365,7 @@ GLSL_DEFINE(eyePosition, GLSL_C(NV_IGRAPH_XF_XFCTX_EYEP))
     "ltc1[" stringify(NV_IGRAPH_XF_LTC1_r0) " + (i)].x\n"
 "\n"
 GLSL_DEFINE(sceneAmbientColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_FR_AMB) ".xyz")
+GLSL_DEFINE(materialEmissionColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_CM_COL) ".xyz")
 "\n"
 "uniform mat4 invViewport;\n"
 "\n");
@@ -431,7 +432,7 @@ GLSL_DEFINE(sceneAmbientColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_FR_AMB) ".xyz")
                 assert(false); /* Untested */
                 break;
             case TEXGEN_SPHERE_MAP:
-                assert(i < 2);  /* Channels S,T only! */
+                assert(j < 2);  /* Channels S,T only! */
                 qstring_append(body, "{\n");
                 /* FIXME: u, r and m only have to be calculated once */
                 qstring_append(body, "  vec3 u = normalize(tPosition.xyz);\n");
@@ -449,10 +450,9 @@ GLSL_DEFINE(sceneAmbientColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_FR_AMB) ".xyz")
                 qstring_append_fmt(body, "  oT%d.%c = r.%c * invM + 0.5;\n",
                                    i, c, c);
                 qstring_append(body, "}\n");
-                assert(false); /* Untested */
                 break;
             case TEXGEN_REFLECTION_MAP:
-                assert(i < 3); /* Channels S,T,R only! */
+                assert(j < 3); /* Channels S,T,R only! */
                 qstring_append(body, "{\n");
                 /* FIXME: u and r only have to be calculated once, can share the one from SPHERE_MAP */
                 qstring_append(body, "  vec3 u = normalize(tPosition.xyz);\n");
@@ -462,7 +462,7 @@ GLSL_DEFINE(sceneAmbientColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_FR_AMB) ".xyz")
                 qstring_append(body, "}\n");
                 break;
             case TEXGEN_NORMAL_MAP:
-                assert(i < 3); /* Channels S,T,R only! */
+                assert(j < 3); /* Channels S,T,R only! */
                 qstring_append_fmt(body, "oT%d.%c = tNormal.%c;\n",
                                    i, c, c);
                 break;
@@ -486,7 +486,24 @@ GLSL_DEFINE(sceneAmbientColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_FR_AMB) ".xyz")
     if (state.lighting) {
 
         //FIXME: Do 2 passes if we want 2 sided-lighting?
-        qstring_append(body, "oD0 = vec4(sceneAmbientColor, diffuse.a);\n");
+
+        if (state.ambient_src == MATERIAL_COLOR_SRC_MATERIAL) {
+            qstring_append(body, "oD0 = vec4(sceneAmbientColor, diffuse.a);\n");
+        } else if (state.ambient_src == MATERIAL_COLOR_SRC_DIFFUSE) {
+            qstring_append(body, "oD0 = vec4(diffuse.rgb, diffuse.a);\n");
+        } else if (state.ambient_src == MATERIAL_COLOR_SRC_SPECULAR) {
+            qstring_append(body, "oD0 = vec4(specular.rgb, diffuse.a);\n");
+        }
+
+        qstring_append(body, "oD0.rgb *= materialEmissionColor.rgb;\n");
+        if (state.emission_src == MATERIAL_COLOR_SRC_MATERIAL) {
+            qstring_append(body, "oD0.rgb += sceneAmbientColor;\n");
+        } else if (state.emission_src == MATERIAL_COLOR_SRC_DIFFUSE) {
+            qstring_append(body, "oD0.rgb += diffuse.rgb;\n");
+        } else if (state.emission_src == MATERIAL_COLOR_SRC_SPECULAR) {
+            qstring_append(body, "oD0.rgb += specular.rgb;\n");
+        }
+
         qstring_append(body, "oD1 = vec4(0.0, 0.0, 0.0, specular.a);\n");
 
         for (i = 0; i < NV2A_MAX_LIGHTS; i++) {

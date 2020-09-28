@@ -303,6 +303,11 @@ void qemu_mutex_unlock_iothread(void);
  */
 void qemu_cond_wait_iothread(QemuCond *cond);
 
+/*
+ * qemu_cond_timedwait_iothread: like the previous, but with timeout
+ */
+void qemu_cond_timedwait_iothread(QemuCond *cond, int ms);
+
 /* internal interfaces */
 
 void qemu_fd_register(int fd);
@@ -324,5 +329,11 @@ typedef struct MainLoopPoll {
 
 void main_loop_poll_add_notifier(Notifier *notify);
 void main_loop_poll_remove_notifier(Notifier *notify);
+
+#ifdef XBOX
+void qemu_init_main_loop_lock(void);
+void qemu_mutex_lock_main_loop(void);
+void qemu_mutex_unlock_main_loop(void);
+#endif
 
 #endif
