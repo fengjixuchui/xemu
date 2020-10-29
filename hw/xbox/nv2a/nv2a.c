@@ -19,58 +19,9 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <assert.h>
-
-#include "qemu/osdep.h"
-#include "qemu/thread.h"
-#include "qemu/main-loop.h"
-#include "qapi/error.h"
-#include "qemu/error-report.h"
-#include "migration/vmstate.h"
-#include "sysemu/runstate.h"
-
-#include "hw/hw.h"
-#include "hw/display/vga.h"
-#include "hw/display/vga_int.h"
-#include "hw/display/vga_regs.h"
-#include "hw/pci/pci.h"
-#include "cpu.h"
-
-#include "swizzle.h"
-
 #include "hw/xbox/nv2a/nv2a_int.h"
 
-#include "hw/xbox/nv2a/nv2a.h"
-
-
-#define DEFINE_PROTO(n)                                              \
-    uint64_t n##_read(void *opaque, hwaddr addr, unsigned int size); \
-    void n##_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size);
-
-DEFINE_PROTO(pmc)
-DEFINE_PROTO(pbus)
-DEFINE_PROTO(pfifo)
-DEFINE_PROTO(prma)
-DEFINE_PROTO(pvideo)
-DEFINE_PROTO(ptimer)
-DEFINE_PROTO(pcounter)
-DEFINE_PROTO(pvpe)
-DEFINE_PROTO(ptv)
-DEFINE_PROTO(prmfb)
-DEFINE_PROTO(prmvio)
-DEFINE_PROTO(pfb)
-DEFINE_PROTO(pstraps)
-DEFINE_PROTO(pgraph)
-DEFINE_PROTO(pcrtc)
-DEFINE_PROTO(prmcio)
-DEFINE_PROTO(pramdac)
-DEFINE_PROTO(prmdio)
-// DEFINE_PROTO(pramin)
-DEFINE_PROTO(user)
-
-#undef DEFINE_PROTO
-
-static void update_irq(NV2AState *d)
+void nv2a_update_irq(NV2AState *d)
 {
     /* PFIFO */
     if (d->pfifo.pending_interrupts & d->pfifo.enabled_interrupts) {
@@ -101,7 +52,7 @@ static void update_irq(NV2AState *d)
     }
 }
 
-static DMAObject nv_dma_load(NV2AState *d, hwaddr dma_obj_address)
+DMAObject nv_dma_load(NV2AState *d, hwaddr dma_obj_address)
 {
     assert(dma_obj_address < memory_region_size(&d->ramin));
 
@@ -118,7 +69,7 @@ static DMAObject nv_dma_load(NV2AState *d, hwaddr dma_obj_address)
     };
 }
 
-static void *nv_dma_map(NV2AState *d, hwaddr dma_obj_address, hwaddr *len)
+void *nv_dma_map(NV2AState *d, hwaddr dma_obj_address, hwaddr *len)
 {
     DMAObject dma = nv_dma_load(d, dma_obj_address);
 
@@ -135,29 +86,14 @@ static void *nv_dma_map(NV2AState *d, hwaddr dma_obj_address, hwaddr *len)
     return d->vram_ptr + dma.address;
 }
 
-#include "nv2a_pbus.c"
-#include "nv2a_pcrtc.c"
-#include "nv2a_pfb.c"
-#include "nv2a_pgraph.c"
-#include "nv2a_pfifo.c"
-#include "nv2a_pmc.c"
-#include "nv2a_pramdac.c"
-#include "nv2a_prmcio.c"
-#include "nv2a_prmvio.c"
-#include "nv2a_ptimer.c"
-#include "nv2a_pvideo.c"
-#include "nv2a_stubs.c"
-#include "nv2a_user.c"
-
-#define ENTRY(NAME, OFFSET, SIZE, RDFUNC, WRFUNC)      \
+const struct NV2ABlockInfo blocktable[] = {
+    #define ENTRY(NAME, OFFSET, SIZE, RDFUNC, WRFUNC)  \
     [NV_##NAME] = {                                    \
         .name   = #NAME,                               \
         .offset = OFFSET,                              \
         .size   = SIZE,                                \
         .ops    = { .read = RDFUNC, .write = WRFUNC }, \
     }
-
-const struct NV2ABlockInfo blocktable[] = {
     ENTRY(PMC,      0x000000, 0x001000, pmc_read,      pmc_write),
     ENTRY(PBUS,     0x001000, 0x001000, pbus_read,     pbus_write),
     ENTRY(PFIFO,    0x002000, 0x002000, pfifo_read,    pfifo_write),
@@ -179,12 +115,12 @@ const struct NV2ABlockInfo blocktable[] = {
     // ENTRY(PRAMIN,   0x700000, 0x100000, pramin_read,   pramin_write),
     ENTRY(USER,     0x800000, 0x800000, user_read,     user_write),
 };
-
 #undef ENTRY
 
-static const char* nv2a_reg_names[] = {};
+#ifdef NV2A_DEBUG
+static const char *nv2a_reg_names[] = {};
 
-static void reg_log_read(int block, hwaddr addr, uint64_t val)
+void nv2a_reg_log_read(int block, hwaddr addr, uint64_t val)
 {
     if (blocktable[block].name) {
         hwaddr naddr = blocktable[block].offset + addr;
@@ -201,7 +137,7 @@ static void reg_log_read(int block, hwaddr addr, uint64_t val)
     }
 }
 
-static void reg_log_write(int block, hwaddr addr, uint64_t val)
+void nv2a_reg_log_write(int block, hwaddr addr, uint64_t val)
 {
     if (blocktable[block].name) {
         hwaddr naddr = blocktable[block].offset + addr;
@@ -217,6 +153,7 @@ static void reg_log_write(int block, hwaddr addr, uint64_t val)
                      block, addr, val);
     }
 }
+#endif
 
 #if 0
 /* FIXME: Probably totally wrong */
@@ -382,7 +319,9 @@ static void nv2a_vga_gfx_update(void *opaque)
 
     NV2AState *d = container_of(vga, NV2AState, vga);
     d->pcrtc.pending_interrupts |= NV_PCRTC_INTR_0_VBLANK;
-    update_irq(d);
+    d->pcrtc.raster = 0;
+
+    nv2a_update_irq(d);
 }
 
 static void nv2a_init_memory(NV2AState *d, MemoryRegion *ram)
@@ -409,6 +348,7 @@ static void nv2a_init_memory(NV2AState *d, MemoryRegion *ram)
     d->ramin_ptr = memory_region_get_ram_ptr(&d->ramin);
 
     memory_region_set_log(d->vram, true, DIRTY_MEMORY_NV2A);
+    memory_region_set_log(d->vram, true, DIRTY_MEMORY_NV2A_TEX);
     memory_region_set_dirty(d->vram, 0, memory_region_size(d->vram));
 
     /* hacky. swap out vga's vram */
@@ -464,7 +404,7 @@ static void nv2a_reset(NV2AState *d)
     d->pgraph.waiting_for_flip = false;
     d->pgraph.waiting_for_fifo_access = false;
     d->pgraph.waiting_for_context_switch = false;
-    d->pgraph.flush_pending = false;
+    d->pgraph.flush_pending = true;
 
     d->pmc.pending_interrupts = 0;
     d->pfifo.pending_interrupts = 0;
@@ -542,6 +482,7 @@ static void nv2a_vm_state_change(void *opaque, int running, RunState state)
 {
     NV2AState *d = opaque;
     if (state == RUN_STATE_SAVE_VM) {
+        // FIXME: writeback all surfaces to RAM before snapshot
         nv2a_lock_fifo(d);
     } else if (state == RUN_STATE_RESTORE_VM) {
         nv2a_reset(d); // Early reset to avoid changing any state during load

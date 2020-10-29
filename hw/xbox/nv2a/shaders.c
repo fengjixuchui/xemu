@@ -21,8 +21,9 @@
 
 #include "qemu/osdep.h"
 #include "qemu-common.h"
-#include "nv2a_shaders_common.h"
-#include "nv2a_shaders.h"
+
+#include "shaders_common.h"
+#include "shaders.h"
 
 void qstring_append_fmt(QString *qstring, const char *fmt, ...)
 {
@@ -842,7 +843,7 @@ static GLuint create_gl_shader(GLenum gl_shader_type,
         glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &log_length);
         log = g_malloc(log_length * sizeof(GLchar));
         glGetShaderInfoLog(shader, log_length, NULL, log);
-        fprintf(stderr, "nv2a: %s compilation failed: %s\n", name, log);
+        fprintf(stderr, "%s\n\n" "nv2a: %s compilation failed: %s\n", code, name, log);
         g_free(log);
 
         NV2A_GL_DGROUP_END();

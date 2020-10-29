@@ -603,6 +603,7 @@
 #   define NV_PCRTC_INTR_EN_0_VBLANK                            (1 << 0)
 #define NV_PCRTC_START                                   0x00000800
 #define NV_PCRTC_CONFIG                                  0x00000804
+#define NV_PCRTC_RASTER                                  0x00000808
 
 
 #define NV_PVIDEO_INTR                                   0x00000100
@@ -1087,6 +1088,7 @@
 #           define NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R8B8           0x29
 # define NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_X8_Y24_FIXED 0x2E
 #           define NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_Y16_FIXED 0x30
+#           define NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_Y16_FLOAT 0x31
 #           define NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_Y16      0x35
 #           define NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8B8G8R8       0x3A
 #           define NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R8G8B8A8       0x3C
@@ -1146,6 +1148,7 @@
 #   define NV097_SET_COMBINER_CONTROL                         0x00001E60
 #   define NV097_SET_SHADOW_ZSLOPE_THRESHOLD                  0x00001E68
 #   define NV097_SET_SHADER_STAGE_PROGRAM                     0x00001E70
+#   define NV097_SET_DOT_RGBMAPPING                           0X00001E74
 #   define NV097_SET_SHADER_OTHER_STAGE_INPUT                 0x00001E78
 #   define NV097_SET_TRANSFORM_EXECUTION_MODE                 0x00001E94
 #       define NV097_SET_TRANSFORM_EXECUTION_MODE_MODE            0x00000003
