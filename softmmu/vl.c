@@ -118,6 +118,7 @@
 #include "ui/xemu-notifications.h"
 #include "ui/xemu-net.h"
 #include "ui/xemu-input.h"
+#include "hw/xbox/eeprom_generation.h"
 
 #define MAX_VIRTIO_CONSOLES 1
 
@@ -2845,6 +2846,28 @@ static int xemu_check_file(const char *path)
     return 0;
 }
 
+// Duplicate commas to escape them
+static char *strdup_double_commas(const char *input) {
+    size_t length = 0;
+    for (const char *i = input; *i; i++) {
+        if (*i == ',') {
+            length++;
+        }
+        length++;
+    }
+    char *output = malloc(length + 1);
+    const char *in = input;
+    char *out = output;
+    while (*in) {
+        if (*in == ',') {
+                *(out++) = ',';
+        }
+        *(out++) = *(in++);
+    }
+    output[length] = 0;
+    return output;
+}
+
 void qemu_init(int argc, char **argv, char **envp)
 {
     int i;
@@ -2890,6 +2913,12 @@ void qemu_init(int argc, char **argv, char **envp)
     error_init(argv[0]);
     module_call_init(MODULE_INIT_TRACE);
 
+    // init earlier because it's needed for eeprom generation
+    if (qcrypto_init(&err) < 0) {
+        error_reportf_err(err, "cannot initialize crypto: ");
+        exit(1);
+    }
+
     //
     // FIXME: This is a hack to get QEMU to load correct machine and properties
     // very early, and handle some basic error cases without hooking QEMU error
@@ -2908,33 +2937,94 @@ void qemu_init(int argc, char **argv, char **envp)
     fake_argv[fake_argc++] = strdup("pentium3");
     fake_argv[fake_argc++] = strdup("-machine");
 
+    char *bootrom_arg = NULL;
     const char *bootrom_path;
     xemu_settings_get_string(XEMU_SETTINGS_SYSTEM_BOOTROM_PATH, &bootrom_path);
-    if (strlen(bootrom_path) > 0 && xemu_check_file(bootrom_path)) {
-        char *msg = g_strdup_printf("Failed to open BootROM file '%s'. Please check machine settings.", bootrom_path);
-        xemu_queue_error_message(msg);
-        g_free(msg);
-        bootrom_path = "";
-    }
 
-    const char *eeprom_path;
-    xemu_settings_get_string(XEMU_SETTINGS_SYSTEM_EEPROM_PATH, &eeprom_path);
-    if (strlen(eeprom_path) > 0 && xemu_check_file(eeprom_path)) {
-        char *msg = g_strdup_printf("Failed to open EEPROM file '%s'. Please check machine settings.", eeprom_path);
-        xemu_queue_error_message(msg);
-        g_free(msg);
-        eeprom_path = "";
+    if (strlen(bootrom_path) > 0) {
+        int bootrom_size = get_image_size(bootrom_path);
+        if (bootrom_size < 0) {
+            char *msg = g_strdup_printf("Failed to open BootROM file '%s'. "
+                                        "Please check machine settings.",
+                                        bootrom_path);
+            xemu_queue_error_message(msg);
+            g_free(msg);
+            bootrom_path = "";
+        } else if (bootrom_size != 512) {
+            char *msg = g_strdup_printf("Invalid BootROM file '%s' size %d. "
+                                        "Expected 512 bytes. Please check "
+                                        "machine settings.",
+                                        bootrom_path, bootrom_size);
+            xemu_queue_error_message(msg);
+            g_free(msg);
+            bootrom_path = "";
+        } else {
+            char *escaped_bootrom_path = strdup_double_commas(bootrom_path);
+            bootrom_arg = g_strdup_printf(",bootrom=%s", escaped_bootrom_path);
+            free(escaped_bootrom_path);
+        }
     }
 
     int short_animation;
     xemu_settings_get_bool(XEMU_SETTINGS_SYSTEM_SHORTANIM, &short_animation);
 
-    fake_argv[fake_argc++] = g_strdup_printf("xbox%s%s%s%s",
-        strlen(bootrom_path) > 0 ? g_strdup_printf(",bootrom=%s", bootrom_path) : "", // Leak
-        strlen(eeprom_path) > 0 ? g_strdup_printf(",eeprom=%s", eeprom_path) : "", // Leak
+    fake_argv[fake_argc++] = g_strdup_printf("xbox%s%s%s",
+        (bootrom_arg != NULL) ? bootrom_arg : "",
         short_animation ? ",short-animation" : "",
         ",kernel-irqchip=off"
         );
+
+    if (bootrom_arg != NULL) {
+        g_free(bootrom_arg);
+    }
+
+    const char *eeprom_path;
+    xemu_settings_get_string(XEMU_SETTINGS_SYSTEM_EEPROM_PATH, &eeprom_path);
+
+    // Sanity check EEPROM file
+    if (strlen(eeprom_path) > 0) {
+        int eeprom_size = get_image_size(eeprom_path);
+        if (eeprom_size < 0) {
+            char *msg = g_strdup_printf("Failed to open EEPROM file '%s'.\n\n"
+                "Automatically generating a new one instead. "
+                "Please check machine settings for the new path and move if desired.", eeprom_path);
+            xemu_queue_error_message(msg);
+            g_free(msg);
+            eeprom_path = "";
+        } else if (eeprom_size != 256) {
+            char *msg = g_strdup_printf(
+                "Invalid EEPROM file '%s' size of %d; should be 256 bytes.\n\n"
+                "Automatically generating a new one instead. "
+                "Please check machine settings for the new path and move if desired.", eeprom_path, eeprom_size);
+            xemu_queue_error_message(msg);
+            g_free(msg);
+            eeprom_path = "";
+        } else {
+            fake_argv[fake_argc++] = strdup("-device");
+            char *escaped_eeprom_path = strdup_double_commas(eeprom_path);
+            fake_argv[fake_argc++] = g_strdup_printf("smbus-storage,file=%s",
+                                                     escaped_eeprom_path);
+            free(escaped_eeprom_path);
+        }
+    }
+
+    // Generate a new EEPROM file if one isn't specified or contents are invalid
+    if (strlen(eeprom_path) == 0) {
+        eeprom_path = xemu_settings_get_default_eeprom_path();
+        if (xbox_eeprom_generate(eeprom_path, XBOX_EEPROM_VERSION_R1)) {
+            xemu_settings_set_string(XEMU_SETTINGS_SYSTEM_EEPROM_PATH, eeprom_path);
+            xemu_settings_save();
+            fake_argv[fake_argc++] = strdup("-device");
+            char *escaped_eeprom_path = strdup_double_commas(eeprom_path);
+            fake_argv[fake_argc++] = g_strdup_printf("smbus-storage,file=%s",
+                                                     escaped_eeprom_path);
+            free(escaped_eeprom_path);
+        } else {
+            char *msg = g_strdup_printf("Failed to generate eeprom file '%s'. Please check machine settings.", eeprom_path);
+            xemu_queue_error_message(msg);
+            g_free(msg);
+        }
+    }
 
     const char *flash_path;
     xemu_settings_get_string(XEMU_SETTINGS_SYSTEM_FLASH_PATH, &flash_path);
@@ -2966,9 +3056,11 @@ void qemu_init(int argc, char **argv, char **envp)
             g_free(msg);
         } else {
             fake_argv[fake_argc++] = strdup("-drive");
+            char *escaped_hdd_path = strdup_double_commas(hdd_path);
             fake_argv[fake_argc++] = g_strdup_printf("index=0,media=disk,file=%s%s",
-                hdd_path,
-                strlen(hdd_path) > 0 ? ",locked" : "");
+                escaped_hdd_path,
+                strlen(escaped_hdd_path) > 0 ? ",locked" : "");
+            free(escaped_hdd_path);
         }
     }
 
@@ -2986,8 +3078,10 @@ void qemu_init(int argc, char **argv, char **envp)
     // Always populate DVD drive. If disc path is the empty string, drive is
     // connected but no media present.
     fake_argv[fake_argc++] = strdup("-drive");
+    char *escaped_dvd_path = strdup_double_commas(dvd_path);
     fake_argv[fake_argc++] = g_strdup_printf("index=1,media=cdrom,file=%s",
-        dvd_path);
+        escaped_dvd_path);
+    free(escaped_dvd_path);
 
     fake_argv[fake_argc++] = strdup("-display");
     fake_argv[fake_argc++] = strdup("xemu");
@@ -3066,11 +3160,6 @@ void qemu_init(int argc, char **argv, char **envp)
     precopy_infrastructure_init();
     postcopy_infrastructure_init();
     monitor_init_globals();
-
-    if (qcrypto_init(&err) < 0) {
-        error_reportf_err(err, "cannot initialize crypto: ");
-        exit(1);
-    }
 
     QTAILQ_INIT(&vm_change_state_head);
     os_setup_early_signal_handling();

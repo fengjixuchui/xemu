@@ -21,6 +21,7 @@
 
 #include "nv2a_int.h"
 #include "xxhash.h"
+#include "s3tc.h"
 
 #define DBG_SURFACES 0
 #define DBG_SURFACE_SYNC 0
@@ -62,7 +63,7 @@ static const GLenum pgraph_texture_min_filter_map[] = {
     GL_LINEAR_MIPMAP_NEAREST,
     GL_NEAREST_MIPMAP_LINEAR,
     GL_LINEAR_MIPMAP_LINEAR,
-    GL_LINEAR, /* TODO: Convolution filter... */
+    GL_LINEAR,
 };
 
 static const GLenum pgraph_texture_mag_filter_map[] = {
@@ -246,10 +247,10 @@ static const ColorFormatInfo kelvin_color_format_map[66] = {
         {2, false, GL_RGB8_SNORM, GL_RGB, GL_BYTE}, /* FIXME: This might be signed */
     [NV097_SET_TEXTURE_FORMAT_COLOR_SZ_G8B8] =
         {2, false, GL_RG8_SNORM, GL_RG, GL_BYTE, /* FIXME: This might be signed */
-         {GL_ZERO, GL_RED, GL_GREEN, GL_ONE}},
+         {GL_ONE, GL_GREEN, GL_RED, GL_ONE}},
     [NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R8B8] =
         {2, false, GL_RG8_SNORM, GL_RG, GL_BYTE, /* FIXME: This might be signed */
-         {GL_RED, GL_ZERO, GL_GREEN, GL_ONE}},
+         {GL_GREEN, GL_ONE, GL_RED, GL_ONE}},
 
 
     /* TODO: format conversion */
@@ -1085,6 +1086,14 @@ void pgraph_method(NV2AState *d,
     case NV097_SET_LIGHTING_ENABLE:
         SET_MASK(pg->regs[NV_PGRAPH_CSV0_C], NV_PGRAPH_CSV0_C_LIGHTING,
                  parameter);
+        break;
+    case NV097_SET_LINE_SMOOTH_ENABLE:
+        SET_MASK(pg->regs[NV_PGRAPH_SETUPRASTER],
+                 NV_PGRAPH_SETUPRASTER_LINESMOOTHENABLE, parameter);
+        break;
+    case NV097_SET_POLY_SMOOTH_ENABLE:
+        SET_MASK(pg->regs[NV_PGRAPH_SETUPRASTER],
+                 NV_PGRAPH_SETUPRASTER_POLYSMOOTHENABLE, parameter);
         break;
     case NV097_SET_SKIN_MODE:
         SET_MASK(pg->regs[NV_PGRAPH_CSV0_D], NV_PGRAPH_CSV0_D_SKIN,
@@ -2146,6 +2155,20 @@ void pgraph_method(NV2AState *d,
                 glEnable(GL_DITHER);
             } else {
                 glDisable(GL_DITHER);
+            }
+
+            /* Edge Antialiasing */
+            if (pg->regs[NV_PGRAPH_SETUPRASTER] &
+                    NV_PGRAPH_SETUPRASTER_LINESMOOTHENABLE) {
+                glEnable(GL_LINE_SMOOTH);
+            } else {
+                glDisable(GL_LINE_SMOOTH);
+            }
+            if (pg->regs[NV_PGRAPH_SETUPRASTER] &
+                    NV_PGRAPH_SETUPRASTER_POLYSMOOTHENABLE) {
+                glEnable(GL_POLYGON_SMOOTH);
+            } else {
+                glDisable(GL_POLYGON_SMOOTH);
             }
 
             //glDisableVertexAttribArray(NV2A_VERTEX_ATTR_DIFFUSE);
@@ -3304,23 +3327,52 @@ static void pgraph_bind_shaders(PGRAPHState *pg)
     }
 
     for (i = 0; i < 4; i++) {
-        state.psh.rect_tex[i] = false;
-        bool enabled = pg->regs[NV_PGRAPH_TEXCTL0_0 + i*4]
-                         & NV_PGRAPH_TEXCTL0_0_ENABLE;
-        unsigned int color_format =
-            GET_MASK(pg->regs[NV_PGRAPH_TEXFMT0 + i*4],
-                     NV_PGRAPH_TEXFMT0_COLOR);
-
-        if (enabled && kelvin_color_format_map[color_format].linear) {
-            state.psh.rect_tex[i] = true;
-        }
-
         for (j = 0; j < 4; j++) {
             state.psh.compare_mode[i][j] =
                 (pg->regs[NV_PGRAPH_SHADERCLIPMODE] >> (4 * i + j)) & 1;
         }
         state.psh.alphakill[i] = pg->regs[NV_PGRAPH_TEXCTL0_0 + i*4]
                                & NV_PGRAPH_TEXCTL0_0_ALPHAKILLEN;
+
+        bool enabled = pg->regs[NV_PGRAPH_TEXCTL0_0 + i*4]
+                         & NV_PGRAPH_TEXCTL0_0_ENABLE;
+        if (!enabled) {
+            continue;
+        }
+
+        unsigned int color_format =
+            GET_MASK(pg->regs[NV_PGRAPH_TEXFMT0 + i*4],
+                     NV_PGRAPH_TEXFMT0_COLOR);
+        ColorFormatInfo f = kelvin_color_format_map[color_format];
+        state.psh.rect_tex[i] = f.linear;
+
+        /* Keep track of whether texture data has been loaded as signed
+         * normalized integers or not. This dictates whether or not we will need
+         * to re-map in fragment shader for certain texture modes (e.g.
+         * bumpenvmap).
+         *
+         * FIXME: When signed texture data is loaded as unsigned and remapped in
+         * fragment shader, there may be interpolation artifacts. Fix this to
+         * support signed textures more appropriately.
+         */
+        state.psh.snorm_tex[i] = (f.gl_internal_format == GL_RGB8_SNORM)
+                                 || (f.gl_internal_format == GL_RG8_SNORM);
+
+        uint32_t filter = pg->regs[NV_PGRAPH_TEXFILTER0 + i*4];
+        unsigned int min_filter = GET_MASK(filter, NV_PGRAPH_TEXFILTER0_MIN);
+        enum ConvolutionFilter kernel = CONVOLUTION_FILTER_DISABLED;
+        /* FIXME: We do not distinguish between min and mag when
+         * performing convolution. Just use it if specified for min (common AA
+         * case).
+         */
+        if (min_filter == NV_PGRAPH_TEXFILTER0_MIN_CONVOLUTION_2D_LOD0) {
+            int k = GET_MASK(filter, NV_PGRAPH_TEXFILTER0_CONVOLUTION_KERNEL);
+            assert(k == NV_PGRAPH_TEXFILTER0_CONVOLUTION_KERNEL_QUINCUNX ||
+                   k == NV_PGRAPH_TEXFILTER0_CONVOLUTION_KERNEL_GAUSSIAN_3);
+            kernel = (enum ConvolutionFilter)k;
+        }
+
+        state.psh.conv_tex[i] = kernel;
     }
 
     ShaderBinding* cached_shader = (ShaderBinding*)g_hash_table_lookup(pg->shader_cache, &state);
@@ -5375,12 +5427,15 @@ static void upload_gl_texture(GLenum gl_target,
                 }
 
                 size_t texture_size = width/4 * height/4 * depth * block_size;
-                assert(glGetError() == GL_NO_ERROR);
-                glCompressedTexImage3D(gl_target, level, f.gl_internal_format,
-                                       width, height, depth, 0,
-                                       texture_size,
-                                       texture_data);
-                assert(glGetError() == GL_NO_ERROR);
+
+                uint8_t *converted = decompress_3d_texture_data(f.gl_internal_format, texture_data, width, height, depth);
+
+                glTexImage3D(gl_target, level,  GL_RGBA8,
+                             width, height, depth, 0,
+                             GL_RGBA, GL_UNSIGNED_INT_8_8_8_8,
+                             converted);
+
+                g_free(converted);
 
                 texture_data += texture_size;
             } else {
