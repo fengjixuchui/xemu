@@ -1,7 +1,7 @@
 /*
  * xemu SDL display driver
  *
- * Copyright (c) 2020 Matt Borgerson
+ * Copyright (c) 2020-2021 Matt Borgerson
  *
  * Based on sdl2.c, sdl2-gl.c
  *
@@ -46,9 +46,18 @@
 #include "xemu-input.h"
 #include "xemu-settings.h"
 #include "xemu-shaders.h"
+#include "xemu-version.h"
 
 #include "hw/xbox/smbus.h" // For eject, drive tray
 #include "hw/xbox/nv2a/nv2a.h"
+
+#ifdef _WIN32
+// Provide hint to prefer high-performance graphics for hybrid systems
+// https://gpuopen.com/learn/amdpowerxpressrequesthighperformance/
+__declspec(dllexport) DWORD AmdPowerXpressRequestHighPerformance = 1;
+// https://docs.nvidia.com/gameworks/content/technologies/desktop/optimus.htm
+__declspec(dllexport) DWORD NvOptimusEnablement = 1;
+#endif
 
 void tcg_register_init_ctx(void); // tcg.c
 
@@ -347,9 +356,10 @@ static void sdl_send_mouse_event(struct sdl2_console *scon, int dx, int dy,
     qemu_input_event_sync();
 }
 
-static void toggle_full_screen(struct sdl2_console *scon)
+static void set_full_screen(struct sdl2_console *scon, bool set)
 {
-    gui_fullscreen = !gui_fullscreen;
+    gui_fullscreen = set;
+
     if (gui_fullscreen) {
         SDL_SetWindowFullscreen(scon->real_window,
                                 SDL_WINDOW_FULLSCREEN_DESKTOP);
@@ -367,6 +377,11 @@ static void toggle_full_screen(struct sdl2_console *scon)
 #if 0
     sdl2_redraw(scon);
 #endif
+}
+
+static void toggle_full_screen(struct sdl2_console *scon)
+{
+    set_full_screen(scon, !gui_fullscreen);
 }
 
 static int get_mod_state(void)
@@ -804,18 +819,22 @@ static void sdl2_display_very_early_init(DisplayOptions *o)
         SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
 
+    char *title = g_strdup_printf("xemu | v%s"
+#if XEMU_DEBUG_BUILD
+                                  " Debug"
+#endif
+                                  , xemu_version);
+
     // Create main window
     m_window = SDL_CreateWindow(
-        "xemu",
-        SDL_WINDOWPOS_CENTERED,
-        SDL_WINDOWPOS_CENTERED,
-        1024, 768,
+        title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1024, 768,
         SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (m_window == NULL) {
         fprintf(stderr, "Failed to create main window\n");
         SDL_Quit();
         exit(1);
     }
+    g_free(title);
 
     m_context = SDL_GL_CreateContext(m_window);
     assert(m_context != NULL);
@@ -918,10 +937,8 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
 #endif
     }
 
-    gui_grab = 0;
-    if (gui_fullscreen) {
-        sdl_grab_start(0);
-    }
+    sdl2_console[0].real_window = m_window;
+    sdl2_console[0].winctx = m_context;
 
     mouse_mode_notifier.notify = sdl_mouse_mode_change;
     qemu_add_mouse_mode_change_notifier(&mouse_mode_notifier);
@@ -1455,6 +1472,12 @@ int main(int argc, char **argv)
 
     DPRINTF("Main thread: waiting for display_init_sem\n");
     qemu_sem_wait(&display_init_sem);
+
+    gui_grab = 0;
+    if (gui_fullscreen) {
+        sdl_grab_start(0);
+        set_full_screen(&sdl2_console[0], gui_fullscreen);
+    }
 
     /*
      * FIXME: May want to create a callback mechanism for main QEMU thread

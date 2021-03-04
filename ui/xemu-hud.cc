@@ -1,7 +1,7 @@
 /*
  * xemu User Interface
  *
- * Copyright (C) 2020 Matt Borgerson
+ * Copyright (C) 2020-2021 Matt Borgerson
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -37,8 +37,9 @@
 #include "xemu-reporting.h"
 
 #include "imgui/imgui.h"
-#include "imgui/examples/imgui_impl_sdl.h"
-#include "imgui/examples/imgui_impl_opengl3.h"
+#include "imgui/backends/imgui_impl_sdl.h"
+#include "imgui/backends/imgui_impl_opengl3.h"
+#include "implot/implot.h"
 
 extern "C" {
 #include "noc_file_dialog.h"
@@ -48,6 +49,8 @@ extern "C" {
 #include "qemu-common.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/runstate.h"
+#include "hw/xbox/mcpx/apu_debug.h"
+#include "hw/xbox/nv2a/debug.h"
 
 #undef typename
 #undef atomic_fetch_add
@@ -130,7 +133,7 @@ private:
         const float fade_in  = 0.1;
         const float fade_out = 0.9;
         float fade = 0;
-        
+
         if (t < fade_in) {
             // Linear fade in
             fade = t/fade_in;
@@ -167,7 +170,7 @@ private:
         ImGui::PopStyleColor();
         ImGui::PopStyleVar();
         ImGui::End();
-    }  
+    }
 };
 
 static void HelpMarker(const char* desc)
@@ -229,7 +232,7 @@ public:
 
         const float footer_height_to_reserve = ImGui::GetStyle().ItemSpacing.y + ImGui::GetFrameHeightWithSpacing(); // 1 separator, 1 input text
         ImGui::BeginChild("ScrollingRegion", ImVec2(0, -footer_height_to_reserve), false, ImGuiWindowFlags_HorizontalScrollbar); // Leave room for 1 separator + 1 InputText
- 
+
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4,1)); // Tighten spacing
         ImGui::PushFont(g_fixed_width_font);
         ImGui::TextUnformatted(xemu_get_monitor_buffer());
@@ -436,7 +439,7 @@ public:
 
         // List available input devices
         const char *not_connected = "Not Connected";
-        struct controller_state *bound_state = xemu_input_get_bound(active);
+        ControllerState *bound_state = xemu_input_get_bound(active);
 
         // Get current controller name
         const char *name;
@@ -459,8 +462,8 @@ public:
             }
 
             // Handle all available input devices
-            struct controller_state *iter;
-            for (iter=available_controllers; iter != NULL; iter=iter->next) {
+            ControllerState *iter;
+            QTAILQ_FOREACH(iter, &available_controllers, entry) {
                 is_selected = bound_state == iter;
                 ImGui::PushID(iter);
                 const char *selectable_label = iter->name;
@@ -500,7 +503,7 @@ public:
             device_selected = true;
             render_controller(0, 0, 0x81dc8a00, 0x0f0f0f00, bound_state);
         } else {
-            static struct controller_state state = { 0 };
+            static ControllerState state = { 0 };
             render_controller(0, 0, 0x1f1f1f00, 0x0f0f0f00, &state);
         }
 
@@ -531,6 +534,22 @@ public:
     }
 };
 
+static const char *paused_file_open(int flags,
+                                    const char *filters,
+                                    const char *default_path,
+                                    const char *default_name)
+{
+    bool is_running = runstate_is_running();
+    if (is_running) {
+        vm_stop(RUN_STATE_PAUSED);
+    }
+    const char *r = noc_file_dialog_open(flags, filters, default_path, default_name);
+    if (is_running) {
+        vm_start();
+    }
+
+    return r;
+}
 
 #define MAX_STRING_LEN 2048 // FIXME: Completely arbitrary and only used here
                             // to give a buffer to ImGui for each field
@@ -557,7 +576,7 @@ public:
         is_open = false;
         dirty = false;
         pending_restart = false;
-    
+
         flash_path[0] = '\0';
         bootrom_path[0] = '\0';
         hdd_path[0] = '\0';
@@ -565,7 +584,7 @@ public:
         memory_idx = 0;
         short_animation = false;
     }
-    
+
     ~SettingsWindow()
     {
     }
@@ -595,7 +614,7 @@ public:
         len = strlen(tmp);
         assert(len < MAX_STRING_LEN);
         strncpy(eeprom_path, tmp, sizeof(eeprom_path));
-        
+
         xemu_settings_get_int(XEMU_SETTINGS_SYSTEM_MEMORY, &tmp_int);
         memory_idx = (tmp_int-64)/64;
 
@@ -626,7 +645,7 @@ public:
         }
         ImGui::SameLine();
         if (ImGui::Button("Browse...", ImVec2(100*g_ui_scale, 0))) {
-            const char *selected = noc_file_dialog_open(NOC_FILE_DIALOG_OPEN, filters, buf, NULL);
+            const char *selected = paused_file_open(NOC_FILE_DIALOG_OPEN, filters, buf, NULL);
             if ((selected != NULL) && (strcmp(buf, selected) != 0)) {
                 strncpy(buf, selected, len-1);
                 dirty = true;
@@ -740,7 +759,7 @@ public:
         // FIXME: Show driver
         // FIXME: Show BIOS/BootROM hash
     }
-    
+
     ~AboutWindow()
     {
     }
@@ -786,7 +805,7 @@ public:
 
         ImGui::SetCursorPosX(10*g_ui_scale);
         ImGui::Dummy(ImVec2(0,20*g_ui_scale));
-        
+
         const char *msg = "Visit https://xemu.app for more information";
         ImGui::SetCursorPosX((ImGui::GetWindowWidth()-ImGui::CalcTextSize(msg).x)/2);
         ImGui::Text("%s", msg);
@@ -910,7 +929,7 @@ public:
             xemu_settings_set_bool(XEMU_SETTINGS_NETWORK_ENABLED, xemu_net_is_enabled());
             xemu_settings_save();
         }
-        
+
         ImGui::End();
     }
 };
@@ -1052,7 +1071,7 @@ public:
 
         ImGui::Columns(2, "", false);
         ImGui::SetColumnWidth(0, ImGui::GetWindowWidth()*0.25);
-        
+
         ImGui::Text("User Token");
         ImGui::SameLine();
         HelpMarker("This is a unique access token used to authorize submission of the report. To request a token, click 'Get Token'.");
@@ -1082,9 +1101,9 @@ public:
         ImGui::SameLine();
         HelpMarker(playability_descriptions[playability]);
         ImGui::NextColumn();
-        
+
         ImGui::Columns(1);
-        
+
         ImGui::Text("Description");
         if (ImGui::InputTextMultiline("###desc", description, sizeof(description), ImVec2(-FLT_MIN, ImGui::GetTextLineHeight() * 6), 0)) {
             report.compat_comments = description;
@@ -1117,10 +1136,10 @@ public:
                 "This information will be archived and used to analyze, resolve problems with, "
                 "and improve the application. This information may be made publicly visible, "
                 "for example: to anyone who wishes to see the playability status of a title, as "
-                "indicated by your report.");    
+                "indicated by your report.");
             ImGui::TreePop();
         }
-        
+
         ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().WindowPadding.y));
         ImGui::Separator();
         ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().WindowPadding.y));
@@ -1149,12 +1168,364 @@ public:
                 xemu_settings_save();
             }
         }
-        
+
         ImGui::End();
     }
 };
 
+#include <math.h>
+
+float mix(float a, float b, float t)
+{
+    return a*(1.0-t) + (b-a)*t;
+}
+
+class DebugApuWindow
+{
+public:
+    bool is_open;
+
+    DebugApuWindow()
+    {
+        is_open = false;
+    }
+
+    ~DebugApuWindow()
+    {
+    }
+
+    void Draw()
+    {
+        if (!is_open) return;
+
+        ImGui::SetNextWindowContentSize(ImVec2(600.0f*g_ui_scale, 0.0f));
+        if (!ImGui::Begin("Audio Debug", &is_open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::End();
+            return;
+        }
+
+        const struct McpxApuDebug *dbg = mcpx_apu_get_debug_info();
+
+
+        ImGui::Columns(2, "", false);
+        int now = SDL_GetTicks() % 1000;
+        float t = now/1000.0f;
+        float freq = 1;
+        float v = fabs(sin(M_PI*t*freq));
+        float c_active = mix(0.4, 0.97, v);
+        float c_inactive = 0.2f;
+
+        int voice_monitor = -1;
+        int voice_info = -1;
+        int voice_mute = -1;
+
+        // Color buttons, demonstrate using PushID() to add unique identifier in the ID stack, and changing style.
+        ImGui::PushFont(g_fixed_width_font);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2, 2));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 4));
+        for (int i = 0; i < 256; i++)
+        {
+            if (i % 16) {
+                ImGui::SameLine();
+            }
+
+            float c, s, h;
+            h = 0.6;
+            if (dbg->vp.v[i].active) {
+                if (dbg->vp.v[i].paused) {
+                    c = c_inactive;
+                    s = 0.4;
+                } else {
+                    c = c_active;
+                    s = 0.7;
+                }
+                if (mcpx_apu_debug_is_muted(i)) {
+                    h = 1.0;
+                }
+            } else {
+                c = c_inactive;
+                s = 0;
+            }
+
+            ImGui::PushID(i);
+            ImGui::PushStyleColor(ImGuiCol_Button, (ImVec4)ImColor::HSV(h, s, c));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, (ImVec4)ImColor::HSV(h, s, 0.8));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, (ImVec4)ImColor::HSV(h, 0.8f, 1.0));
+            char buf[12];
+            snprintf(buf, sizeof(buf), "%02x", i);
+            ImGui::Button(buf);
+            if (/*dbg->vp.v[i].active &&*/ ImGui::IsItemHovered()) {
+                voice_monitor = i;
+                voice_info = i;
+            }
+            if (ImGui::IsItemClicked(1)) {
+                voice_mute = i;
+            }
+            ImGui::PopStyleColor(3);
+            ImGui::PopID();
+        }
+        ImGui::PopStyleVar(3);
+        ImGui::PopFont();
+
+        if (voice_info >= 0) {
+            const struct McpxApuDebugVoice *voice = &dbg->vp.v[voice_info];
+            ImGui::BeginTooltip();
+            bool is_paused = voice->paused;
+            ImGui::Text("Voice 0x%x/%d %s", voice_info, voice_info, is_paused ? "(Paused)" : "");
+            ImGui::SameLine();
+            ImGui::Text(voice->stereo ? "Stereo" : "Mono");
+
+            ImGui::Separator();
+            ImGui::PushFont(g_fixed_width_font);
+
+            const char *noyes[2] = { "NO", "YES" };
+            ImGui::Text("Stream: %-3s Loop: %-3s Persist: %-3s Multipass: %-3s "
+                        "Linked: %-3s",
+                        noyes[voice->stream], noyes[voice->loop],
+                        noyes[voice->persist], noyes[voice->multipass],
+                        noyes[voice->linked]);
+
+            const char *cs[4] = { "1 byte", "2 bytes", "ADPCM", "4 bytes" };
+            const char *ss[4] = {
+                "Unsigned 8b PCM",
+                "Signed 16b PCM",
+                "Signed 24b PCM",
+                "Signed 32b PCM"
+            };
+
+            assert(voice->container_size < 4);
+            assert(voice->sample_size < 4);
+            ImGui::Text("Container Size: %s, Sample Size: %s, Samples per Block: %d",
+                cs[voice->container_size], ss[voice->sample_size], voice->samples_per_block);
+            ImGui::Text("Rate: %f (%d Hz)", voice->rate, (int)(48000.0/voice->rate));
+            ImGui::Text("EBO=%d CBO=%d LBO=%d BA=%x",
+                voice->ebo, voice->cbo, voice->lbo, voice->ba);
+            ImGui::Text("Mix: ");
+            for (int i = 0; i < 8; i++) {
+                if (i == 4) ImGui::Text("     ");
+                ImGui::SameLine();
+                char buf[64];
+                if (voice->vol[i] == 0xFFF) {
+                    snprintf(buf, sizeof(buf),
+                        "Bin %2d (MUTE) ", voice->bin[i]);
+                } else {
+                    snprintf(buf, sizeof(buf),
+                        "Bin %2d (-%.3f) ", voice->bin[i],
+                        (float)((voice->vol[i] >> 6) & 0x3f) +
+                        (float)((voice->vol[i] >> 0) & 0x3f) / 64.0);
+                }
+                ImGui::Text("%-17s", buf);
+            }
+            ImGui::PopFont();
+            ImGui::EndTooltip();
+        }
+
+        if (voice_monitor >= 0) {
+            mcpx_apu_debug_isolate_voice(voice_monitor);
+        } else {
+            mcpx_apu_debug_clear_isolations();
+        }
+        if (voice_mute >= 0) {
+            mcpx_apu_debug_toggle_mute(voice_mute);
+        }
+
+        ImGui::SameLine();
+        ImGui::SetColumnWidth(0, ImGui::GetCursorPosX());
+        ImGui::NextColumn();
+
+        ImGui::PushFont(g_fixed_width_font);
+        ImGui::Text("Frames:      %04d", dbg->frames_processed);
+        ImGui::Text("GP Cycles:   %04d", dbg->gp.cycles);
+        ImGui::Text("EP Cycles:   %04d", dbg->ep.cycles);
+        bool color = (dbg->utilization > 0.9);
+        if (color) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1,0,0,1));
+        ImGui::Text("Utilization: %.2f%%", (dbg->utilization*100));
+        if (color) ImGui::PopStyleColor();
+        ImGui::PopFont();
+
+        ImGui::Separator();
+
+        static int mon = 0;
+        mon = mcpx_apu_debug_get_monitor();
+        if (ImGui::Combo("Monitor", &mon, "AC97\0VP Only\0GP Only\0EP Only\0GP/EP if enabled\0")) {
+            mcpx_apu_debug_set_monitor(mon);
+        }
+
+        static bool gp_realtime;
+        gp_realtime = dbg->gp_realtime;
+        if (ImGui::Checkbox("GP Realtime\n", &gp_realtime)) {
+            mcpx_apu_debug_set_gp_realtime_enabled(gp_realtime);
+        }
+
+        static bool ep_realtime;
+        ep_realtime = dbg->ep_realtime;
+        if (ImGui::Checkbox("EP Realtime\n", &ep_realtime)) {
+            mcpx_apu_debug_set_ep_realtime_enabled(ep_realtime);
+        }
+
+        ImGui::Columns(1);
+        ImGui::End();
+    }
+};
+
+
+
+// utility structure for realtime plot
+struct ScrollingBuffer {
+    int MaxSize;
+    int Offset;
+    ImVector<ImVec2> Data;
+    ScrollingBuffer() {
+        MaxSize = 2000;
+        Offset  = 0;
+        Data.reserve(MaxSize);
+    }
+    void AddPoint(float x, float y) {
+        if (Data.size() < MaxSize)
+            Data.push_back(ImVec2(x,y));
+        else {
+            Data[Offset] = ImVec2(x,y);
+            Offset =  (Offset + 1) % MaxSize;
+        }
+    }
+    void Erase() {
+        if (Data.size() > 0) {
+            Data.shrink(0);
+            Offset  = 0;
+        }
+    }
+};
+
+class DebugVideoWindow
+{
+public:
+    bool is_open;
+    bool transparent;
+
+    DebugVideoWindow()
+    {
+        is_open = false;
+        transparent = false;
+    }
+
+    ~DebugVideoWindow()
+    {
+    }
+
+    void Draw()
+    {
+        if (!is_open) return;
+
+        float alpha = transparent ? 0.2 : 1.0;
+
+        ImVec4 c;
+
+        c = ImGui::GetStyle().Colors[transparent ? ImGuiCol_WindowBg : ImGuiCol_TitleBg];
+        c.w *= alpha;
+        ImGui::PushStyleColor(ImGuiCol_TitleBg, c);
+
+        c = ImGui::GetStyle().Colors[transparent ? ImGuiCol_WindowBg : ImGuiCol_TitleBgActive];
+        c.w *= alpha;
+        ImGui::PushStyleColor(ImGuiCol_TitleBgActive, c);
+
+        c = ImGui::GetStyle().Colors[ImGuiCol_WindowBg];
+        c.w *= alpha;
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, c);
+
+        c = ImGui::GetStyle().Colors[ImGuiCol_Border];
+        c.w *= alpha;
+        ImGui::PushStyleColor(ImGuiCol_Border, c);
+
+        c = ImGui::GetStyle().Colors[ImGuiCol_FrameBg];
+        c.w *= alpha;
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, c);
+
+        ImGui::SetNextWindowSize(ImVec2(600.0f*g_ui_scale, 150.0f*g_ui_scale), ImGuiCond_Once);
+        if (ImGui::Begin("Video Debug", &is_open)) {
+
+            double x_start, x_end;
+            static ImPlotAxisFlags rt_axis = ImPlotAxisFlags_NoTickLabels;
+            ImPlot::PushStyleVar(ImPlotStyleVar_PlotPadding, ImVec2(5,5));
+            ImPlot::PushStyleVar(ImPlotStyleVar_FillAlpha, 0.25f);
+            static ScrollingBuffer fps;
+            static float t = 0;
+            if (runstate_is_running()) {
+                t += ImGui::GetIO().DeltaTime;
+                fps.AddPoint(t, g_nv2a_stats.increment_fps);
+            }
+            x_start = t - 10.0;
+            x_end = t;
+            ImPlot::SetNextPlotLimitsX(x_start, x_end, ImGuiCond_Always);
+            ImPlot::SetNextPlotLimitsY(0, 65, ImGuiCond_Always);
+
+            float plot_width = 0.5 * (ImGui::GetWindowSize().x -
+                                      2 * ImGui::GetStyle().WindowPadding.x -
+                                      ImGui::GetStyle().ItemSpacing.x);
+
+            ImGui::SetNextWindowBgAlpha(alpha);
+            if (ImPlot::BeginPlot("##ScrollingFPS", NULL, NULL, ImVec2(plot_width,75*g_ui_scale), 0, rt_axis, rt_axis | ImPlotAxisFlags_Lock)) {
+                if (fps.Data.size() > 0) {
+                    ImPlot::PlotShaded("##fps", &fps.Data[0].x, &fps.Data[0].y, fps.Data.size(), 0, fps.Offset, 2 * sizeof(float));
+                    ImPlot::PlotLine("##fps", &fps.Data[0].x, &fps.Data[0].y, fps.Data.size(), fps.Offset, 2 * sizeof(float));
+                }
+                ImPlot::AnnotateClamped(x_start, 65, ImVec2(0,0), ImPlot::GetLastItemColor(), "FPS: %d", g_nv2a_stats.increment_fps);
+                ImPlot::EndPlot();
+            }
+
+            ImGui::SameLine();
+
+            x_end = g_nv2a_stats.frame_count;
+            x_start = x_end - NV2A_PROF_NUM_FRAMES;
+
+            ImPlot::SetNextPlotLimitsX(x_start, x_end, ImGuiCond_Always);
+            ImPlot::SetNextPlotLimitsY(0, 100, ImGuiCond_Always);
+            ImPlot::PushStyleColor(ImPlotCol_Line, ImPlot::GetColormapColor(1));
+            ImGui::SetNextWindowBgAlpha(alpha);
+            if (ImPlot::BeginPlot("##ScrollingMSPF", NULL, NULL, ImVec2(plot_width,75*g_ui_scale), 0, rt_axis, rt_axis | ImPlotAxisFlags_Lock)) {
+                ImPlot::PlotShaded("##mspf", &g_nv2a_stats.frame_history[0].mspf, NV2A_PROF_NUM_FRAMES, 0, 1, x_start, g_nv2a_stats.frame_ptr, sizeof(g_nv2a_stats.frame_working));
+                ImPlot::PlotLine("##mspf", &g_nv2a_stats.frame_history[0].mspf, NV2A_PROF_NUM_FRAMES, 1, x_start, g_nv2a_stats.frame_ptr, sizeof(g_nv2a_stats.frame_working));
+                ImPlot::AnnotateClamped(x_start, 100, ImVec2(0,0), ImPlot::GetLastItemColor(), "MSPF: %d", g_nv2a_stats.frame_history[(g_nv2a_stats.frame_ptr - 1) % NV2A_PROF_NUM_FRAMES].mspf);
+                ImPlot::EndPlot();
+            }
+            ImPlot::PopStyleColor();
+
+            if (ImGui::TreeNode("Advanced")) {
+                ImPlot::SetNextPlotLimitsX(x_start, x_end, ImGuiCond_Always);
+                ImPlot::SetNextPlotLimitsY(0, 1500, ImGuiCond_Always);
+                ImGui::SetNextWindowBgAlpha(alpha);
+                if (ImPlot::BeginPlot("##ScrollingDraws", NULL, NULL, ImVec2(-1,500), 0, rt_axis, rt_axis | ImPlotAxisFlags_Lock)) {
+                    for (int i = 0; i < NV2A_PROF__COUNT; i++) {
+                        ImGui::PushID(i);
+                        char title[64];
+                        snprintf(title, sizeof(title), "%s: %d",
+                            nv2a_profile_get_counter_name(i),
+                            nv2a_profile_get_counter_value(i));
+                        ImPlot::PushStyleColor(ImPlotCol_Line, ImPlot::GetColormapColor(i));
+                        ImPlot::PushStyleColor(ImPlotCol_Fill, ImPlot::GetColormapColor(i));
+                        ImPlot::PlotLine(title, &g_nv2a_stats.frame_history[0].counters[i], NV2A_PROF_NUM_FRAMES, 1, x_start, g_nv2a_stats.frame_ptr, sizeof(g_nv2a_stats.frame_working));
+                        ImPlot::PopStyleColor(2);
+                        ImGui::PopID();
+                    }
+                    ImPlot::EndPlot();
+                }
+                ImGui::TreePop();
+            }
+
+            if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(2)) {
+                transparent = !transparent;
+            }
+
+            ImPlot::PopStyleVar(2);
+        }
+        ImGui::End();
+        ImGui::PopStyleColor(5);
+    }
+};
+
 static MonitorWindow monitor_window;
+static DebugApuWindow apu_window;
+static DebugVideoWindow video_window;
 static InputWindow input_window;
 static NetworkWindow network_window;
 static AboutWindow about_window;
@@ -1172,7 +1543,7 @@ public:
     {
         is_open = false;
     }
-    
+
     ~FirstBootWindow()
     {
     }
@@ -1240,7 +1611,7 @@ public:
         if (ImGui::IsItemClicked()) {
             xemu_open_web_browser("https://xemu.app");
         }
-        
+
         ImGui::End();
     }
 };
@@ -1265,7 +1636,7 @@ static void action_load_disc(void)
     const char *iso_file_filters = ".iso Files\0*.iso\0All Files\0*.*\0";
     const char *current_disc_path;
     xemu_settings_get_string(XEMU_SETTINGS_SYSTEM_DVD_PATH, &current_disc_path);
-    const char *new_disc_path = noc_file_dialog_open(NOC_FILE_DIALOG_OPEN, iso_file_filters, current_disc_path, NULL);
+    const char *new_disc_path = paused_file_open(NOC_FILE_DIALOG_OPEN, iso_file_filters, current_disc_path, NULL);
     if (new_disc_path == NULL) {
         /* Cancelled */
         return;
@@ -1385,6 +1756,8 @@ static void ShowMainMenu()
         if (ImGui::BeginMenu("Debug"))
         {
             ImGui::MenuItem("Monitor", NULL, &monitor_window.is_open);
+            ImGui::MenuItem("Audio", NULL, &apu_window.is_open);
+            ImGui::MenuItem("Video", NULL, &video_window.is_open);
             ImGui::EndMenu();
         }
 
@@ -1415,6 +1788,7 @@ static void InitializeStyle()
     ImGui_ImplOpenGL3_CreateFontsTexture();
 
     ImGuiStyle style;
+    style.WindowRounding = 8.0;
     style.FrameRounding = 8.0;
     style.GrabRounding = 12.0;
     style.PopupRounding = 5.0;
@@ -1512,6 +1886,8 @@ void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
     g_ui_scale = ui_scale_int;
 
     g_sdl_window = window;
+
+    ImPlot::CreateContext();
 }
 
 void xemu_hud_cleanup(void)
@@ -1530,19 +1906,20 @@ void xemu_hud_should_capture_kbd_mouse(int *kbd, int *mouse)
 {
     ImGuiIO& io = ImGui::GetIO();
     if (kbd) *kbd = io.WantCaptureKeyboard;
-    if (mouse) *mouse = io.WantCaptureMouse; 
+    if (mouse) *mouse = io.WantCaptureMouse;
 }
 
 void xemu_hud_render(void)
 {
     uint32_t now = SDL_GetTicks();
     bool ui_wakeup = false;
-    struct controller_state *iter;
 
     // Combine all controller states to allow any controller to navigate
     uint32_t buttons = 0;
     int16_t axis[CONTROLLER_AXIS__COUNT] = {0};
-    for (iter=available_controllers; iter != NULL; iter=iter->next) {
+
+    ControllerState *iter;
+    QTAILQ_FOREACH(iter, &available_controllers, entry) {
         if (iter->type != INPUT_DEVICE_SDL_GAMECONTROLLER) continue;
         buttons |= iter->buttons;
         // We simply take any axis that is >10 % activation
@@ -1670,6 +2047,8 @@ void xemu_hud_render(void)
     input_window.Draw();
     settings_window.Draw();
     monitor_window.Draw();
+    apu_window.Draw();
+    video_window.Draw();
     about_window.Draw();
     network_window.Draw();
     compatibility_reporter_window.Draw();

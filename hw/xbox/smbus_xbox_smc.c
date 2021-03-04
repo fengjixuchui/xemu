@@ -2,7 +2,7 @@
  * QEMU SMBus Xbox System Management Controller
  *
  * Copyright (c) 2011 espes
- * Copyright (c) 2020 Matt Borgerson
+ * Copyright (c) 2020-2021 Matt Borgerson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -91,7 +91,7 @@
 #define SMC_REG_SCRATCH             0x1b
 #define     SMC_REG_SCRATCH_SHORT_ANIMATION 0x04
 
-static const char *smc_version_string = "P01";
+static const char smc_version_string[] = "P01";
 
 typedef struct SMBusSMCDevice {
     SMBusDevice smbusdev;

@@ -5,7 +5,7 @@
  * that gets saved to an INI file. All entries should be accessed through the
  * appropriate getter/setter functions.
  *
- * Copyright (C) 2020 Matt Borgerson
+ * Copyright (C) 2020-2021 Matt Borgerson
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -36,6 +36,7 @@ enum xemu_settings_keys {
 	XEMU_SETTINGS_SYSTEM_DVD_PATH,
 	XEMU_SETTINGS_SYSTEM_MEMORY,
 	XEMU_SETTINGS_SYSTEM_SHORTANIM,
+	XEMU_SETTINGS_AUDIO_USE_DSP,
 	XEMU_SETTINGS_DISPLAY_SCALE,
 	XEMU_SETTINGS_DISPLAY_UI_SCALE,
 	XEMU_SETTINGS_INPUT_CONTROLLER_1_GUID,
@@ -69,6 +70,9 @@ enum xemu_net_backend {
 
 // Determine whether settings were loaded or not
 int xemu_settings_did_fail_to_load(void);
+
+// Override the default config file paths
+void xemu_settings_set_path(const char *path);
 
 // Get path of the config file on disk
 const char *xemu_settings_get_path(void);

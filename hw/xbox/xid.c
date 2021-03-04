@@ -3,7 +3,7 @@
  *
  * Copyright (c) 2013 espes
  * Copyright (c) 2017 Jannik Vogel
- * Copyright (c) 2018-2020 Matt Borgerson
+ * Copyright (c) 2018-2021 Matt Borgerson
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -198,7 +198,7 @@ static void update_output(USBXIDState *s)
         return;
     }
 
-    struct controller_state *state = xemu_input_get_bound(s->device_index);
+    ControllerState *state = xemu_input_get_bound(s->device_index);
     assert(state);
     state->rumble_l = s->out_state.left_actuator_strength;
     state->rumble_r = s->out_state.right_actuator_strength;
@@ -212,7 +212,7 @@ static void update_input(USBXIDState *s)
         return;
     }
 
-    struct controller_state *state = xemu_input_get_bound(s->device_index);
+    ControllerState *state = xemu_input_get_bound(s->device_index);
     assert(state);
 
     const int button_map_analog[6][2] = {

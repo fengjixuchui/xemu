@@ -3,7 +3,7 @@
  *
  * Copyright (c) 2012 espes
  * Copyright (c) 2015 Jannik Vogel
- * Copyright (c) 2018-2020 Matt Borgerson
+ * Copyright (c) 2018-2021 Matt Borgerson
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -20,39 +20,75 @@
  */
 
 #include "nv2a_int.h"
-#include "xxhash.h"
+#include "xxHash/xxh3.h"
 #include "s3tc.h"
 
 #define DBG_SURFACES 0
 #define DBG_SURFACE_SYNC 0
-#define DBG_FRAME_TIME 0
 
 static NV2AState *g_nv2a;
 GloContext *g_nv2a_context_render;
 GloContext *g_nv2a_context_display;
 
-#if DBG_FRAME_TIME
-static int64_t g_last_flip_time;
-#endif
+NV2AStats g_nv2a_stats;
 
 static void nv2a_profile_increment(void)
 {
-#if DBG_FRAME_TIME
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-    g_last_flip_time = now;
-#endif
+    int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    const int64_t fps_update_interval = 250000;
+    g_nv2a_stats.last_flip_time = now;
+
+    static int64_t frame_count = 0;
+    frame_count++;
+
+    static int64_t ts = 0;
+    int64_t delta = now - ts;
+    if (delta >= fps_update_interval) {
+        g_nv2a_stats.increment_fps = frame_count * 1000000 / delta;
+        ts = now;
+        frame_count = 0;
+    }
 }
 
 static void nv2a_profile_flip_stall(void)
 {
-#if DBG_FRAME_TIME
     glFinish();
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-    int64_t render_time = (now-g_last_flip_time)/1000000;
-    NV2A_XPRINTF(DBG_FRAME_TIME,
-        "**** Render Time = %ld ms (~%.2f FPS)\n",
-        render_time, 1000.0f/(float)(render_time > 0 ? render_time : 1));
-#endif
+
+    int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    int64_t render_time = (now-g_nv2a_stats.last_flip_time)/1000;
+
+    g_nv2a_stats.frame_working.mspf = render_time;
+    g_nv2a_stats.frame_history[g_nv2a_stats.frame_ptr] =
+        g_nv2a_stats.frame_working;
+    g_nv2a_stats.frame_ptr =
+        (g_nv2a_stats.frame_ptr + 1) % NV2A_PROF_NUM_FRAMES;
+    g_nv2a_stats.frame_count++;
+    memset(&g_nv2a_stats.frame_working, 0, sizeof(g_nv2a_stats.frame_working));
+}
+
+static void nv2a_profile_inc_counter(enum NV2A_PROF_COUNTERS_ENUM cnt)
+{
+    g_nv2a_stats.frame_working.counters[cnt] += 1;
+}
+
+const char *nv2a_profile_get_counter_name(unsigned int cnt)
+{
+    const char *default_names[NV2A_PROF__COUNT] = {
+        #define _X(x) stringify(x),
+        NV2A_PROF_COUNTERS_XMAC
+        #undef _X
+    };
+
+    assert(cnt < NV2A_PROF__COUNT);
+    return default_names[cnt] + 10; /* 'NV2A_PROF_' */
+}
+
+int nv2a_profile_get_counter_value(unsigned int cnt)
+{
+    assert(cnt < NV2A_PROF__COUNT);
+    unsigned int idx = (g_nv2a_stats.frame_ptr + NV2A_PROF_NUM_FRAMES - 1) %
+                       NV2A_PROF_NUM_FRAMES;
+    return g_nv2a_stats.frame_history[idx].counters[cnt];
 }
 
 static const GLenum pgraph_texture_min_filter_map[] = {
@@ -80,7 +116,7 @@ static const GLenum pgraph_texture_addr_map[] = {
     GL_MIRRORED_REPEAT,
     GL_CLAMP_TO_EDGE,
     GL_CLAMP_TO_BORDER,
-    // GL_CLAMP
+    GL_CLAMP_TO_EDGE, /* Approximate GL_CLAMP */
 };
 
 static const GLenum pgraph_blend_factor_map[] = {
@@ -112,6 +148,7 @@ static const GLenum pgraph_blend_equation_map[] = {
     GL_FUNC_ADD,
 };
 
+/* FIXME
 static const GLenum pgraph_blend_logicop_map[] = {
     GL_CLEAR,
     GL_AND,
@@ -130,6 +167,7 @@ static const GLenum pgraph_blend_logicop_map[] = {
     GL_NAND,
     GL_SET,
 };
+*/
 
 static const GLenum pgraph_cull_face_map[] = {
     0,
@@ -346,9 +384,23 @@ static uint8_t* convert_texture_data(const TextureShape s, const uint8_t *data, 
 static void upload_gl_texture(GLenum gl_target, const TextureShape s, const uint8_t *texture_data, const uint8_t *palette_data);
 static TextureBinding* generate_texture(const TextureShape s, const uint8_t *texture_data, const uint8_t *palette_data);
 static void texture_binding_destroy(gpointer data);
-static struct lru_node *texture_cache_entry_init(struct lru_node *obj, void *key);
-static struct lru_node *texture_cache_entry_deinit(struct lru_node *obj);
-static int texture_cache_entry_compare(struct lru_node *obj, void *key);
+static void texture_cache_entry_init(Lru *lru, LruNode *node, void *key);
+static void texture_cache_entry_post_evict(Lru *lru, LruNode *node);
+static bool texture_cache_entry_compare(Lru *lru, LruNode *node, void *key);
+
+static void vertex_cache_entry_init(Lru *lru, LruNode *node, void *key)
+{
+    VertexLruNode *vnode = container_of(node, VertexLruNode, node);
+    memcpy(&vnode->key, key, sizeof(struct VertexKey));
+    vnode->initialized = false;
+}
+
+static bool vertex_cache_entry_compare(Lru *lru, LruNode *node, void *key)
+{
+    VertexLruNode *vnode = container_of(node, VertexLruNode, node);
+    return memcmp(&vnode->key, key, sizeof(VertexKey));
+}
+
 static void pgraph_mark_textures_possibly_dirty(NV2AState *d, hwaddr addr, hwaddr size);
 static bool pgraph_check_texture_dirty(NV2AState *d, hwaddr addr, hwaddr size);
 static guint shader_hash(gconstpointer key);
@@ -498,9 +550,10 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
                      NV_PGRAPH_CHANNEL_CTX_POINTER_INST) << 4;
 
         if (val & NV_PGRAPH_CHANNEL_CTX_TRIGGER_READ_IN) {
+#ifdef DEBUG_NV2A
             unsigned pgraph_channel_id =
                 GET_MASK(pg->regs[NV_PGRAPH_CTX_USER], NV_PGRAPH_CTX_USER_CHID);
-
+#endif
             NV2A_DPRINTF("PGRAPH: read channel %d context from %" HWADDR_PRIx "\n",
                          pgraph_channel_id, context_address);
 
@@ -561,13 +614,38 @@ static void pgraph_flush(NV2AState *d)
     // FIXME: Flush more?
 }
 
-void pgraph_method(NV2AState *d,
-                   unsigned int subchannel,
-                   unsigned int method,
-                   uint32_t parameter)
+/* Temp helpers to aide hot methods. */
+#define NON_INC_METHOD_LOOP_BEGIN \
+    for (size_t param_iter = 0; \
+         param_iter < num_words_available; \
+         param_iter++) { \
+        parameter = ldl_le_p(parameters + param_iter);
+
+#define NON_INC_METHOD_LOOP_END \
+        method += 4; \
+    } \
+    num_processed = num_words_available;
+
+#define INC_METHOD_LOOP_BEGIN(METHOD_END) \
+    for (size_t param_iter = 0; \
+         (param_iter < num_words_available) && (method <= METHOD_END); \
+         param_iter++) { \
+        parameter = ldl_le_p(parameters + param_iter);
+
+#define INC_METHOD_LOOP_END \
+        method += 4; \
+    } \
+    num_processed = num_words_available;
+
+int pgraph_method(NV2AState *d, unsigned int subchannel,
+                   unsigned int method, uint32_t parameter,
+                   uint32_t *parameters, size_t num_words_available)
 {
     int i;
     unsigned int slot;
+    int num_processed = 1;
+
+    assert(glGetError() == GL_NO_ERROR);
 
     PGRAPHState *pg = &d->pgraph;
 
@@ -1419,53 +1497,63 @@ void pgraph_method(NV2AState *d,
 
     case NV097_SET_PROJECTION_MATRIX ...
             NV097_SET_PROJECTION_MATRIX + 0x3c: {
+        INC_METHOD_LOOP_BEGIN(NV097_SET_PROJECTION_MATRIX + 0x3c)
         slot = (method - NV097_SET_PROJECTION_MATRIX) / 4;
         // pg->projection_matrix[slot] = *(float*)&parameter;
         unsigned int row = NV_IGRAPH_XF_XFCTX_PMAT0 + slot/4;
         pg->vsh_constants[row][slot%4] = parameter;
         pg->vsh_constants_dirty[row] = true;
+        INC_METHOD_LOOP_END
         break;
     }
 
     case NV097_SET_MODEL_VIEW_MATRIX ...
             NV097_SET_MODEL_VIEW_MATRIX + 0xfc: {
+        INC_METHOD_LOOP_BEGIN(NV097_SET_MODEL_VIEW_MATRIX + 0xfc)
         slot = (method - NV097_SET_MODEL_VIEW_MATRIX) / 4;
         unsigned int matnum = slot / 16;
         unsigned int entry = slot % 16;
         unsigned int row = NV_IGRAPH_XF_XFCTX_MMAT0 + matnum*8 + entry/4;
         pg->vsh_constants[row][entry % 4] = parameter;
         pg->vsh_constants_dirty[row] = true;
+        INC_METHOD_LOOP_END
         break;
     }
 
     case NV097_SET_INVERSE_MODEL_VIEW_MATRIX ...
             NV097_SET_INVERSE_MODEL_VIEW_MATRIX + 0xfc: {
+        INC_METHOD_LOOP_BEGIN(NV097_SET_INVERSE_MODEL_VIEW_MATRIX + 0xfc)
         slot = (method - NV097_SET_INVERSE_MODEL_VIEW_MATRIX) / 4;
         unsigned int matnum = slot / 16;
         unsigned int entry = slot % 16;
         unsigned int row = NV_IGRAPH_XF_XFCTX_IMMAT0 + matnum*8 + entry/4;
         pg->vsh_constants[row][entry % 4] = parameter;
         pg->vsh_constants_dirty[row] = true;
+        INC_METHOD_LOOP_END
         break;
     }
 
     case NV097_SET_COMPOSITE_MATRIX ...
             NV097_SET_COMPOSITE_MATRIX + 0x3c: {
+        INC_METHOD_LOOP_BEGIN(NV097_SET_COMPOSITE_MATRIX + 0x3c)
         slot = (method - NV097_SET_COMPOSITE_MATRIX) / 4;
         unsigned int row = NV_IGRAPH_XF_XFCTX_CMAT0 + slot/4;
         pg->vsh_constants[row][slot%4] = parameter;
         pg->vsh_constants_dirty[row] = true;
+        INC_METHOD_LOOP_END
         break;
     }
 
     case NV097_SET_TEXTURE_MATRIX ...
             NV097_SET_TEXTURE_MATRIX + 0xfc: {
+        INC_METHOD_LOOP_BEGIN(NV097_SET_TEXTURE_MATRIX + 0xfc)
         slot = (method - NV097_SET_TEXTURE_MATRIX) / 4;
         unsigned int tex = slot / 16;
         unsigned int entry = slot % 16;
         unsigned int row = NV_IGRAPH_XF_XFCTX_T0MAT + tex*8 + entry/4;
         pg->vsh_constants[row][entry%4] = parameter;
         pg->vsh_constants_dirty[row] = true;
+        INC_METHOD_LOOP_END
         break;
     }
 
@@ -1560,7 +1648,7 @@ void pgraph_method(NV2AState *d,
 
     case NV097_SET_TRANSFORM_PROGRAM ...
             NV097_SET_TRANSFORM_PROGRAM + 0x7c: {
-
+        INC_METHOD_LOOP_BEGIN(NV097_SET_TRANSFORM_PROGRAM + 0x7c)
         slot = (method - NV097_SET_TRANSFORM_PROGRAM) / 4;
 
         int program_load = GET_MASK(pg->regs[NV_PGRAPH_CHEOPS_OFFSET],
@@ -1573,15 +1661,14 @@ void pgraph_method(NV2AState *d,
             SET_MASK(pg->regs[NV_PGRAPH_CHEOPS_OFFSET],
                      NV_PGRAPH_CHEOPS_OFFSET_PROG_LD_PTR, program_load+1);
         }
-
+        INC_METHOD_LOOP_END
         break;
     }
 
     case NV097_SET_TRANSFORM_CONSTANT ...
             NV097_SET_TRANSFORM_CONSTANT + 0x7c: {
-
+        INC_METHOD_LOOP_BEGIN(NV097_SET_TRANSFORM_CONSTANT + 0x7c)
         slot = (method - NV097_SET_TRANSFORM_CONSTANT) / 4;
-
         int const_load = GET_MASK(pg->regs[NV_PGRAPH_CHEOPS_OFFSET],
                                   NV_PGRAPH_CHEOPS_OFFSET_CONST_LD_PTR);
 
@@ -1595,11 +1682,13 @@ void pgraph_method(NV2AState *d,
             SET_MASK(pg->regs[NV_PGRAPH_CHEOPS_OFFSET],
                      NV_PGRAPH_CHEOPS_OFFSET_CONST_LD_PTR, const_load+1);
         }
+        INC_METHOD_LOOP_END
         break;
     }
 
     case NV097_SET_VERTEX3F ...
             NV097_SET_VERTEX3F + 8: {
+        INC_METHOD_LOOP_BEGIN(NV097_SET_VERTEX3F + 8)
         slot = (method - NV097_SET_VERTEX3F) / 4;
         VertexAttribute *attribute =
             &pg->vertex_attributes[NV2A_VERTEX_ATTR_POSITION];
@@ -1609,6 +1698,7 @@ void pgraph_method(NV2AState *d,
         if (slot == 2) {
             pgraph_finish_inline_buffer_vertex(pg);
         }
+        INC_METHOD_LOOP_END
         break;
     }
 
@@ -1715,6 +1805,7 @@ void pgraph_method(NV2AState *d,
 
     case NV097_SET_VERTEX4F ...
             NV097_SET_VERTEX4F + 12: {
+        INC_METHOD_LOOP_BEGIN(NV097_SET_VERTEX4F + 12)
         slot = (method - NV097_SET_VERTEX4F) / 4;
         VertexAttribute *attribute =
             &pg->vertex_attributes[NV2A_VERTEX_ATTR_POSITION];
@@ -1723,11 +1814,13 @@ void pgraph_method(NV2AState *d,
         if (slot == 3) {
             pgraph_finish_inline_buffer_vertex(pg);
         }
+        INC_METHOD_LOOP_END
         break;
     }
 
     case NV097_SET_VERTEX_DATA_ARRAY_FORMAT ...
             NV097_SET_VERTEX_DATA_ARRAY_FORMAT + 0x3c: {
+        INC_METHOD_LOOP_BEGIN(NV097_SET_VERTEX_DATA_ARRAY_FORMAT + 0x3c)
 
         slot = (method - NV097_SET_VERTEX_DATA_ARRAY_FORMAT) / 4;
         VertexAttribute *vertex_attribute = &pg->vertex_attributes[slot];
@@ -1804,11 +1897,13 @@ void pgraph_method(NV2AState *d,
             }
         }
 
+        INC_METHOD_LOOP_END
         break;
     }
 
     case NV097_SET_VERTEX_DATA_ARRAY_OFFSET ...
             NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 0x3c:
+        INC_METHOD_LOOP_BEGIN(NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 0x3c)
 
         slot = (method - NV097_SET_VERTEX_DATA_ARRAY_OFFSET) / 4;
 
@@ -1819,6 +1914,7 @@ void pgraph_method(NV2AState *d,
 
         pg->vertex_attributes[slot].converted_elements = 0;
 
+        INC_METHOD_LOOP_END
         break;
 
     case NV097_SET_LOGIC_OP_ENABLE:
@@ -1905,9 +2001,12 @@ void pgraph_method(NV2AState *d,
 
         if (parameter == NV097_SET_BEGIN_END_OP_END) {
 
+            nv2a_profile_inc_counter(NV2A_PROF_BEGIN_ENDS);
+
             assert(pg->shader_binding);
 
             if (pg->draw_arrays_length) {
+                nv2a_profile_inc_counter(NV2A_PROF_DRAW_ARRAYS);
 
                 NV2A_GL_DPRINTF(false, "Draw Arrays");
 
@@ -1922,6 +2021,7 @@ void pgraph_method(NV2AState *d,
                                   pg->gl_draw_arrays_count,
                                   pg->draw_arrays_length);
             } else if (pg->inline_buffer_length) {
+                nv2a_profile_inc_counter(NV2A_PROF_INLINE_BUFFERS);
 
                 NV2A_GL_DPRINTF(false, "Inline Buffer");
 
@@ -1932,19 +2032,18 @@ void pgraph_method(NV2AState *d,
                 for (i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
                     VertexAttribute *attribute = &pg->vertex_attributes[i];
 
-                    if (attribute->inline_buffer) {
-
+                    if (attribute->inline_buffer_populated) {
+                        nv2a_profile_inc_counter(NV2A_PROF_GEOM_BUFFER_UPDATE_3);
                         glBindBuffer(GL_ARRAY_BUFFER,
                                      attribute->gl_inline_buffer);
                         glBufferData(GL_ARRAY_BUFFER,
                                      pg->inline_buffer_length
                                         * sizeof(float) * 4,
                                      attribute->inline_buffer,
-                                     GL_DYNAMIC_DRAW);
+                                     GL_STREAM_DRAW);
 
                         /* Clear buffer for next batch */
-                        g_free(attribute->inline_buffer);
-                        attribute->inline_buffer = NULL;
+                        attribute->inline_buffer_populated = false;
 
                         glVertexAttribPointer(i, 4, GL_FLOAT, GL_FALSE, 0, 0);
                         glEnableVertexAttribArray(i);
@@ -1959,6 +2058,7 @@ void pgraph_method(NV2AState *d,
                 glDrawArrays(pg->shader_binding->gl_primitive_mode,
                              0, pg->inline_buffer_length);
             } else if (pg->inline_array_length) {
+                nv2a_profile_inc_counter(NV2A_PROF_INLINE_ARRAYS);
 
                 NV2A_GL_DPRINTF(false, "Inline Array");
 
@@ -1970,6 +2070,7 @@ void pgraph_method(NV2AState *d,
                 glDrawArrays(pg->shader_binding->gl_primitive_mode,
                              0, index_count);
             } else if (pg->inline_elements_length) {
+                nv2a_profile_inc_counter(NV2A_PROF_INLINE_ELEMENTS);
 
                 NV2A_GL_DPRINTF(false, "Inline Elements");
 
@@ -1978,26 +2079,15 @@ void pgraph_method(NV2AState *d,
                 assert(pg->inline_array_length == 0);
 
                 uint32_t max_element = 0;
-                uint32_t min_element = (uint32_t)-1;
                 for (i=0; i<pg->inline_elements_length; i++) {
                     max_element = MAX(pg->inline_elements[i], max_element);
-                    min_element = MIN(pg->inline_elements[i], min_element);
                 }
 
                 pgraph_bind_vertex_attributes(d, max_element+1, false, 0);
 
-                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, pg->gl_element_buffer);
-                glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                             pg->inline_elements_length*4,
-                             pg->inline_elements,
-                             GL_DYNAMIC_DRAW);
-
-                glDrawRangeElements(pg->shader_binding->gl_primitive_mode,
-                                    min_element, max_element,
-                                    pg->inline_elements_length,
-                                    GL_UNSIGNED_INT,
-                                    (void*)0);
-
+                glDrawElements(pg->shader_binding->gl_primitive_mode,
+                               pg->inline_elements_length, GL_UNSIGNED_INT,
+                               (void *)pg->inline_elements);
             } else {
                 NV2A_GL_DPRINTF(true, "EMPTY NV097_SET_BEGIN_END");
                 NV2A_UNCONFIRMED("EMPTY NV097_SET_BEGIN_END");
@@ -2005,6 +2095,7 @@ void pgraph_method(NV2AState *d,
 
             /* End of visibility testing */
             if (pg->zpass_pixel_count_enable) {
+                nv2a_profile_inc_counter(NV2A_PROF_QUERY);
                 glEndQuery(GL_SAMPLES_PASSED);
             }
 
@@ -2320,16 +2411,20 @@ void pgraph_method(NV2AState *d,
         break;
 
     case NV097_ARRAY_ELEMENT16:
+        NON_INC_METHOD_LOOP_BEGIN
         assert(pg->inline_elements_length < NV2A_MAX_BATCH_LENGTH);
         pg->inline_elements[
             pg->inline_elements_length++] = parameter & 0xFFFF;
         pg->inline_elements[
             pg->inline_elements_length++] = parameter >> 16;
+        NON_INC_METHOD_LOOP_END
         break;
     case NV097_ARRAY_ELEMENT32:
+        NON_INC_METHOD_LOOP_BEGIN
         assert(pg->inline_elements_length < NV2A_MAX_BATCH_LENGTH);
         pg->inline_elements[
             pg->inline_elements_length++] = parameter;
+        NON_INC_METHOD_LOOP_END
         break;
     case NV097_DRAW_ARRAYS: {
 
@@ -2358,9 +2453,11 @@ void pgraph_method(NV2AState *d,
         break;
     }
     case NV097_INLINE_ARRAY:
+        NON_INC_METHOD_LOOP_BEGIN
         assert(pg->inline_array_length < NV2A_MAX_BATCH_LENGTH);
         pg->inline_array[
             pg->inline_array_length++] = parameter;
+        NON_INC_METHOD_LOOP_END
         break;
     case NV097_SET_EYE_VECTOR ...
             NV097_SET_EYE_VECTOR + 8:
@@ -2370,6 +2467,7 @@ void pgraph_method(NV2AState *d,
 
     case NV097_SET_VERTEX_DATA2F_M ...
             NV097_SET_VERTEX_DATA2F_M + 0x7c: {
+        INC_METHOD_LOOP_BEGIN(NV097_SET_VERTEX_DATA2F_M + 0x7c)
         slot = (method - NV097_SET_VERTEX_DATA2F_M) / 4;
         unsigned int part = slot % 2;
         slot /= 2;
@@ -2382,10 +2480,12 @@ void pgraph_method(NV2AState *d,
         if ((slot == 0) && (part == 1)) {
             pgraph_finish_inline_buffer_vertex(pg);
         }
+        INC_METHOD_LOOP_END
         break;
     }
     case NV097_SET_VERTEX_DATA4F_M ...
             NV097_SET_VERTEX_DATA4F_M + 0xfc: {
+        INC_METHOD_LOOP_BEGIN(NV097_SET_VERTEX_DATA4F_M + 0xfc)
         slot = (method - NV097_SET_VERTEX_DATA4F_M) / 4;
         unsigned int part = slot % 4;
         slot /= 4;
@@ -2395,10 +2495,12 @@ void pgraph_method(NV2AState *d,
         if ((slot == 0) && (part == 3)) {
             pgraph_finish_inline_buffer_vertex(pg);
         }
+        INC_METHOD_LOOP_END
         break;
     }
     case NV097_SET_VERTEX_DATA2S ...
             NV097_SET_VERTEX_DATA2S + 0x3c: {
+        INC_METHOD_LOOP_BEGIN(NV097_SET_VERTEX_DATA2S + 0x3c)
         slot = (method - NV097_SET_VERTEX_DATA2S) / 4;
         VertexAttribute *attribute = &pg->vertex_attributes[slot];
         pgraph_allocate_inline_buffer_vertices(pg, slot);
@@ -2409,10 +2511,12 @@ void pgraph_method(NV2AState *d,
         if (slot == 0) {
             pgraph_finish_inline_buffer_vertex(pg);
         }
+        INC_METHOD_LOOP_END
         break;
     }
     case NV097_SET_VERTEX_DATA4UB ...
             NV097_SET_VERTEX_DATA4UB + 0x3c: {
+        INC_METHOD_LOOP_BEGIN(NV097_SET_VERTEX_DATA4UB + 0x3c)
         slot = (method - NV097_SET_VERTEX_DATA4UB) / 4;
         VertexAttribute *attribute = &pg->vertex_attributes[slot];
         pgraph_allocate_inline_buffer_vertices(pg, slot);
@@ -2423,6 +2527,7 @@ void pgraph_method(NV2AState *d,
         if (slot == 0) {
             pgraph_finish_inline_buffer_vertex(pg);
         }
+        INC_METHOD_LOOP_END
         break;
     }
     case NV097_SET_VERTEX_DATA4S_M ...
@@ -2741,6 +2846,8 @@ void pgraph_method(NV2AState *d,
         break;
 
     }
+
+    return num_processed;
 }
 
 void pgraph_context_switch(NV2AState *d, unsigned int channel_id)
@@ -2820,13 +2927,12 @@ static void pgraph_allocate_inline_buffer_vertices(PGRAPHState *pg,
     int i;
     VertexAttribute *attribute = &pg->vertex_attributes[attr];
 
-    if (attribute->inline_buffer || pg->inline_buffer_length == 0) {
+    if (attribute->inline_buffer_populated || pg->inline_buffer_length == 0) {
         return;
     }
 
     /* Now upload the previous attribute value */
-    attribute->inline_buffer = (float*)g_malloc(NV2A_MAX_BATCH_LENGTH
-                                                  * sizeof(float) * 4);
+    attribute->inline_buffer_populated = true;
     for (i = 0; i < pg->inline_buffer_length; i++) {
         memcpy(&attribute->inline_buffer[i * 4],
                attribute->inline_value,
@@ -2842,7 +2948,7 @@ static void pgraph_finish_inline_buffer_vertex(PGRAPHState *pg)
 
     for (i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
         VertexAttribute *attribute = &pg->vertex_attributes[i];
-        if (attribute->inline_buffer) {
+        if (attribute->inline_buffer_populated) {
             memcpy(&attribute->inline_buffer[
                       pg->inline_buffer_length * 4],
                    attribute->inline_value,
@@ -2871,6 +2977,8 @@ void pgraph_init(NV2AState *d)
     pg->downloads_pending = false;
 
     qemu_mutex_init(&pg->lock);
+    qemu_event_init(&pg->gl_sync_complete, false);
+    qemu_event_init(&pg->downloads_complete, false);
 
     /* fire up opengl */
     glo_set_current(g_nv2a_context_render);
@@ -2899,25 +3007,42 @@ void pgraph_init(NV2AState *d)
 
     // Initialize texture cache
     const size_t texture_cache_size = 512;
-    lru_init(&pg->texture_cache,
-        &texture_cache_entry_init,
-        &texture_cache_entry_deinit,
-        &texture_cache_entry_compare);
-    pg->texture_cache_entries = malloc(texture_cache_size * sizeof(struct TextureKey));
+    lru_init(&pg->texture_cache);
+    pg->texture_cache_entries = malloc(texture_cache_size * sizeof(TextureLruNode));
     assert(pg->texture_cache_entries != NULL);
     for (i = 0; i < texture_cache_size; i++) {
         lru_add_free(&pg->texture_cache, &pg->texture_cache_entries[i].node);
     }
 
+    pg->texture_cache.init_node = texture_cache_entry_init;
+    pg->texture_cache.compare_nodes = texture_cache_entry_compare;
+    pg->texture_cache.post_node_evict = texture_cache_entry_post_evict;
+
+    // Initialize vertex cache
+    const size_t vertex_cache_size = 10*1024;
+    lru_init(&pg->vertex_cache);
+    pg->vertex_cache_entries = malloc(vertex_cache_size * sizeof(VertexLruNode));
+    assert(pg->vertex_cache_entries != NULL);
+    GLuint vertex_cache_buffers[vertex_cache_size];
+    glGenBuffers(vertex_cache_size, vertex_cache_buffers);
+    for (i = 0; i < vertex_cache_size; i++) {
+        pg->vertex_cache_entries[i].gl_buffer = vertex_cache_buffers[i];
+        lru_add_free(&pg->vertex_cache, &pg->vertex_cache_entries[i].node);
+    }
+
+    pg->vertex_cache.init_node = vertex_cache_entry_init;
+    pg->vertex_cache.compare_nodes = vertex_cache_entry_compare;
+
     pg->shader_cache = g_hash_table_new(shader_hash, shader_equal);
 
-
     for (i=0; i<NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
-        glGenBuffers(1, &pg->vertex_attributes[i].gl_converted_buffer);
-        glGenBuffers(1, &pg->vertex_attributes[i].gl_inline_buffer);
+        VertexAttribute *attribute = &pg->vertex_attributes[i];
+        glGenBuffers(1, &attribute->gl_inline_buffer);
+        attribute->inline_buffer = (float*)g_malloc(NV2A_MAX_BATCH_LENGTH
+                                              * sizeof(float) * 4);
+        attribute->inline_buffer_populated = false;
     }
     glGenBuffers(1, &pg->gl_inline_array_buffer);
-    glGenBuffers(1, &pg->gl_element_buffer);
 
     glGenBuffers(1, &pg->gl_memory_buffer);
     glBindBuffer(GL_ARRAY_BUFFER, pg->gl_memory_buffer);
@@ -3001,7 +3126,6 @@ static void pgraph_shader_update_constants(PGRAPHState *pg,
 
     /* For each texture stage */
     for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
-        // char name[32];
         GLint loc;
 
         /* Bump luminance only during stages 1 - 3 */
@@ -3041,7 +3165,6 @@ static void pgraph_shader_update_constants(PGRAPHState *pg,
                     *(float*)&pg->regs[NV_PGRAPH_FOGPARAM1]);
     }
 
-
     float zclip_max = *(float*)&pg->regs[NV_PGRAPH_ZCLIPMAX];
     float zclip_min = *(float*)&pg->regs[NV_PGRAPH_ZCLIPMIN];
 
@@ -3072,7 +3195,6 @@ static void pgraph_shader_update_constants(PGRAPHState *pg,
                 lighting_dirty[j] = false;
             }
         }
-
 
         for (i = 0; i < NV2A_MAX_LIGHTS; i++) {
             GLint loc;
@@ -3119,7 +3241,6 @@ static void pgraph_shader_update_constants(PGRAPHState *pg,
             glUniformMatrix4fv(binding->inv_viewport_loc,
                                1, GL_FALSE, &invViewport[0]);
         }
-
     }
 
     /* update vertex program constants */
@@ -3127,7 +3248,6 @@ static void pgraph_shader_update_constants(PGRAPHState *pg,
         if (!pg->vsh_constants_dirty[i] && !binding_changed) continue;
 
         GLint loc = binding->vsh_constant_loc[i];
-        //assert(loc != -1);
         if (loc != -1) {
             glUniform4fv(loc, 1, (const GLfloat*)pg->vsh_constants[i]);
         }
@@ -3164,54 +3284,54 @@ static void pgraph_bind_shaders(PGRAPHState *pg)
 
     ShaderBinding* old_binding = pg->shader_binding;
 
-    ShaderState state = {
-        .psh = (PshState){
+    ShaderState state;
+    memset(&state, 0, sizeof(ShaderState));
+
             /* register combier stuff */
-            .window_clip_exclusive = pg->regs[NV_PGRAPH_SETUPRASTER]
-                                       & NV_PGRAPH_SETUPRASTER_WINDOWCLIPTYPE,
-            .combiner_control = pg->regs[NV_PGRAPH_COMBINECTL],
-            .shader_stage_program = pg->regs[NV_PGRAPH_SHADERPROG],
-            .other_stage_input = pg->regs[NV_PGRAPH_SHADERCTL],
-            .final_inputs_0 = pg->regs[NV_PGRAPH_COMBINESPECFOG0],
-            .final_inputs_1 = pg->regs[NV_PGRAPH_COMBINESPECFOG1],
+    state.psh.window_clip_exclusive = pg->regs[NV_PGRAPH_SETUPRASTER]
+                                       & NV_PGRAPH_SETUPRASTER_WINDOWCLIPTYPE;
+    state.psh.combiner_control = pg->regs[NV_PGRAPH_COMBINECTL];
+    state.psh.shader_stage_program = pg->regs[NV_PGRAPH_SHADERPROG];
+    state.psh.other_stage_input = pg->regs[NV_PGRAPH_SHADERCTL];
+    state.psh.final_inputs_0 = pg->regs[NV_PGRAPH_COMBINESPECFOG0];
+    state.psh.final_inputs_1 = pg->regs[NV_PGRAPH_COMBINESPECFOG1];
 
-            .alpha_test = pg->regs[NV_PGRAPH_CONTROL_0]
-                            & NV_PGRAPH_CONTROL_0_ALPHATESTENABLE,
-            .alpha_func = (enum PshAlphaFunc)GET_MASK(pg->regs[NV_PGRAPH_CONTROL_0],
-                                   NV_PGRAPH_CONTROL_0_ALPHAFUNC),
-        },
+    state.psh.alpha_test = pg->regs[NV_PGRAPH_CONTROL_0]
+                            & NV_PGRAPH_CONTROL_0_ALPHATESTENABLE;
+    state.psh.alpha_func = (enum PshAlphaFunc)GET_MASK(pg->regs[NV_PGRAPH_CONTROL_0],
+                                   NV_PGRAPH_CONTROL_0_ALPHAFUNC);
 
-        /* fixed function stuff */
-        .skinning = (enum VshSkinning)GET_MASK(pg->regs[NV_PGRAPH_CSV0_D],
-                                               NV_PGRAPH_CSV0_D_SKIN),
-        .lighting = GET_MASK(pg->regs[NV_PGRAPH_CSV0_C],
-                             NV_PGRAPH_CSV0_C_LIGHTING),
-        .normalization = pg->regs[NV_PGRAPH_CSV0_C]
-                           & NV_PGRAPH_CSV0_C_NORMALIZATION_ENABLE,
+    state.fixed_function = fixed_function;
 
-        /* color material */
-        .emission_src = (enum MaterialColorSource)GET_MASK(pg->regs[NV_PGRAPH_CSV0_C], NV_PGRAPH_CSV0_C_EMISSION),
-        .ambient_src = (enum MaterialColorSource)GET_MASK(pg->regs[NV_PGRAPH_CSV0_C], NV_PGRAPH_CSV0_C_AMBIENT),
-        .diffuse_src = (enum MaterialColorSource)GET_MASK(pg->regs[NV_PGRAPH_CSV0_C], NV_PGRAPH_CSV0_C_DIFFUSE),
-        .specular_src = (enum MaterialColorSource)GET_MASK(pg->regs[NV_PGRAPH_CSV0_C], NV_PGRAPH_CSV0_C_SPECULAR),
+    /* fixed function stuff */
+    if (fixed_function) {
+    state.skinning = (enum VshSkinning)GET_MASK(pg->regs[NV_PGRAPH_CSV0_D],
+                                           NV_PGRAPH_CSV0_D_SKIN);
+    state.lighting = GET_MASK(pg->regs[NV_PGRAPH_CSV0_C],
+                         NV_PGRAPH_CSV0_C_LIGHTING);
+    state.normalization = pg->regs[NV_PGRAPH_CSV0_C]
+                       & NV_PGRAPH_CSV0_C_NORMALIZATION_ENABLE;
 
-        .fixed_function = fixed_function,
+    /* color material */
+    state.emission_src = (enum MaterialColorSource)GET_MASK(pg->regs[NV_PGRAPH_CSV0_C], NV_PGRAPH_CSV0_C_EMISSION);
+    state.ambient_src = (enum MaterialColorSource)GET_MASK(pg->regs[NV_PGRAPH_CSV0_C], NV_PGRAPH_CSV0_C_AMBIENT);
+    state.diffuse_src = (enum MaterialColorSource)GET_MASK(pg->regs[NV_PGRAPH_CSV0_C], NV_PGRAPH_CSV0_C_DIFFUSE);
+    state.specular_src = (enum MaterialColorSource)GET_MASK(pg->regs[NV_PGRAPH_CSV0_C], NV_PGRAPH_CSV0_C_SPECULAR);
+    }
 
-        /* vertex program stuff */
-        .vertex_program = vertex_program,
-        .z_perspective = pg->regs[NV_PGRAPH_CONTROL_0]
-                            & NV_PGRAPH_CONTROL_0_Z_PERSPECTIVE_ENABLE,
+    /* vertex program stuff */
+    state.vertex_program = vertex_program,
+    state.z_perspective = pg->regs[NV_PGRAPH_CONTROL_0]
+                        & NV_PGRAPH_CONTROL_0_Z_PERSPECTIVE_ENABLE;
 
-        /* geometry shader stuff */
-        .primitive_mode = (enum ShaderPrimitiveMode)pg->primitive_mode,
-        .polygon_front_mode = (enum ShaderPolygonMode)GET_MASK(pg->regs[NV_PGRAPH_SETUPRASTER],
-                                                               NV_PGRAPH_SETUPRASTER_FRONTFACEMODE),
-        .polygon_back_mode = (enum ShaderPolygonMode)GET_MASK(pg->regs[NV_PGRAPH_SETUPRASTER],
-                                                              NV_PGRAPH_SETUPRASTER_BACKFACEMODE),
-    };
+    /* geometry shader stuff */
+    state.primitive_mode = (enum ShaderPrimitiveMode)pg->primitive_mode;
+    state.polygon_front_mode = (enum ShaderPolygonMode)GET_MASK(pg->regs[NV_PGRAPH_SETUPRASTER],
+                                                           NV_PGRAPH_SETUPRASTER_FRONTFACEMODE);
+    state.polygon_back_mode = (enum ShaderPolygonMode)GET_MASK(pg->regs[NV_PGRAPH_SETUPRASTER],
+                                                          NV_PGRAPH_SETUPRASTER_BACKFACEMODE);
 
     state.program_length = 0;
-    memset(state.program_data, 0, sizeof(state.program_data));
 
     if (vertex_program) {
         // copy in vertex program tokens
@@ -3309,12 +3429,6 @@ static void pgraph_bind_shaders(PGRAPHState *pg)
         last_y = y;
     }
 
-    /* FIXME: We should memset(state, 0x00, sizeof(state)) instead */
-    memset(state.psh.rgb_inputs, 0, sizeof(state.psh.rgb_inputs));
-    memset(state.psh.rgb_outputs, 0, sizeof(state.psh.rgb_outputs));
-    memset(state.psh.alpha_inputs, 0, sizeof(state.psh.alpha_inputs));
-    memset(state.psh.alpha_outputs, 0, sizeof(state.psh.alpha_outputs));
-
     /* Copy content of enabled combiner stages */
     int num_stages = pg->regs[NV_PGRAPH_COMBINECTL] & 0xFF;
     for (i = 0; i < num_stages; i++) {
@@ -3380,6 +3494,7 @@ static void pgraph_bind_shaders(PGRAPHState *pg)
         pg->shader_binding = cached_shader;
     } else {
         pg->shader_binding = generate_shaders(state);
+        nv2a_profile_inc_counter(NV2A_PROF_SHADER_GEN);
 
         /* cache it */
         ShaderState *cache_state = (ShaderState *)g_malloc(sizeof(*cache_state));
@@ -3389,6 +3504,9 @@ static void pgraph_bind_shaders(PGRAPHState *pg)
     }
 
     bool binding_changed = (pg->shader_binding != old_binding);
+    if (binding_changed) {
+        nv2a_profile_inc_counter(NV2A_PROF_SHADER_BIND);
+    }
 
     glUseProgram(pg->shader_binding->gl_program);
 
@@ -3574,6 +3692,8 @@ static void pgraph_render_surface_to_texture(NV2AState *d,
     const ColorFormatInfo *f = &kelvin_color_format_map[texture_shape->color_format];
     assert(texture_shape->color_format < ARRAY_SIZE(kelvin_color_format_map));
 
+    nv2a_profile_inc_counter(NV2A_PROF_SURF_TO_TEX);
+
     glActiveTexture(GL_TEXTURE0 + texture_unit);
 
     // Reallocate space for new texture, bind as render target
@@ -3653,19 +3773,35 @@ static void pgraph_init_display_renderer(NV2AState *d)
         "    gl_Position = vec4(x, y, 0, 1);\n"
         "}\n";
     // FIXME: gamma correction
-    // FIXME: video overlay
+
     const char *fs =
         "#version 330\n"
         "uniform sampler2D tex;\n"
+        "uniform bool pvideo_enable;\n"
+        "uniform sampler2D pvideo_tex;\n"
+        "uniform vec4 pvideo_pos;\n"
         "layout(location = 0) out vec4 out_Color;\n"
         "void main()\n"
         "{\n"
         "    vec2 texCoord = gl_FragCoord.xy/textureSize(tex,0).xy;\n"
         "    out_Color.rgba = texture(tex, texCoord);\n"
+        "    if (pvideo_enable) {\n"
+        "        vec4 extent = vec4(pvideo_pos.xy, pvideo_pos.xy + pvideo_pos.zw);\n"
+        "        bvec4 clip = bvec4(lessThan(gl_FragCoord.xy, extent.xy),\n"
+        "                           greaterThan(gl_FragCoord.xy, extent.zw));\n"
+        "        if (!any(clip)) {\n"
+        "            vec2 spos = vec2(gl_FragCoord.x, textureSize(tex,0).y-gl_FragCoord.y);\n"
+        "            vec2 coord = (spos-pvideo_pos.xy)/pvideo_pos.zw;\n"
+        "            out_Color.rgba = texture(pvideo_tex, coord);\n"
+        "        }\n"
+        "    }\n"
         "}\n";
 
     pg->disp_rndr.prog = pgraph_compile_shader(vs, fs);
     pg->disp_rndr.tex_loc = glGetUniformLocation(pg->disp_rndr.prog, "tex");
+    pg->disp_rndr.pvideo_enable_loc = glGetUniformLocation(pg->disp_rndr.prog, "pvideo_enable");
+    pg->disp_rndr.pvideo_tex_loc = glGetUniformLocation(pg->disp_rndr.prog, "pvideo_tex");
+    pg->disp_rndr.pvideo_pos_loc = glGetUniformLocation(pg->disp_rndr.prog, "pvideo_pos");
 
     glGenVertexArrays(1, &pg->disp_rndr.vao);
     glBindVertexArray(pg->disp_rndr.vao);
@@ -3673,7 +3809,88 @@ static void pgraph_init_display_renderer(NV2AState *d)
     glBindBuffer(GL_ARRAY_BUFFER, pg->disp_rndr.vbo);
     glBufferData(GL_ARRAY_BUFFER, 0, NULL, GL_STATIC_DRAW);
     glGenFramebuffers(1, &pg->disp_rndr.fbo);
+    glGenTextures(1, &pg->disp_rndr.pvideo_tex);
     assert(glGetError() == GL_NO_ERROR);
+}
+
+static uint8_t *convert_texture_data__CR8YB8CB8YA8(const uint8_t *data,
+                                                   unsigned int width,
+                                                   unsigned int height,
+                                                   unsigned int pitch)
+{
+    uint8_t *converted_data = (uint8_t *)g_malloc(width * height * 4);
+    int x, y;
+    for (y = 0; y < height; y++) {
+        const uint8_t *line = &data[y * pitch];
+        for (x = 0; x < width; x++) {
+            uint8_t *pixel = &converted_data[(y * width + x) * 4];
+            /* FIXME: Actually needs uyvy? */
+            convert_yuy2_to_rgb(line, x, &pixel[0], &pixel[1], &pixel[2]);
+            pixel[3] = 255;
+        }
+    }
+    return converted_data;
+}
+
+static void pgraph_render_display_pvideo_overlay(NV2AState *d)
+{
+    bool enabled = d->pvideo.regs[NV_PVIDEO_BUFFER] & NV_PVIDEO_BUFFER_0_USE;
+    glUniform1ui(d->pgraph.disp_rndr.pvideo_enable_loc, enabled);
+    if (!enabled) {
+        return;
+    }
+
+    hwaddr base = d->pvideo.regs[NV_PVIDEO_BASE];
+    hwaddr limit = d->pvideo.regs[NV_PVIDEO_LIMIT];
+    hwaddr offset = d->pvideo.regs[NV_PVIDEO_OFFSET];
+
+    int in_width =
+        GET_MASK(d->pvideo.regs[NV_PVIDEO_SIZE_IN], NV_PVIDEO_SIZE_IN_WIDTH);
+    int in_height =
+        GET_MASK(d->pvideo.regs[NV_PVIDEO_SIZE_IN], NV_PVIDEO_SIZE_IN_HEIGHT);
+
+    /* FIXME
+    int in_s = GET_MASK(d->pvideo.regs[NV_PVIDEO_POINT_IN],
+                        NV_PVIDEO_POINT_IN_S);
+    int in_t = GET_MASK(d->pvideo.regs[NV_PVIDEO_POINT_IN],
+                        NV_PVIDEO_POINT_IN_T);
+    */
+    int in_pitch =
+        GET_MASK(d->pvideo.regs[NV_PVIDEO_FORMAT], NV_PVIDEO_FORMAT_PITCH);
+    int in_color =
+        GET_MASK(d->pvideo.regs[NV_PVIDEO_FORMAT], NV_PVIDEO_FORMAT_COLOR);
+
+    /* TODO: support other color formats */
+    assert(in_color == NV_PVIDEO_FORMAT_COLOR_LE_CR8YB8CB8YA8);
+    assert(in_pitch >= in_width * 2);
+
+    int out_width =
+        GET_MASK(d->pvideo.regs[NV_PVIDEO_SIZE_OUT], NV_PVIDEO_SIZE_OUT_WIDTH);
+    int out_height =
+        GET_MASK(d->pvideo.regs[NV_PVIDEO_SIZE_OUT], NV_PVIDEO_SIZE_OUT_HEIGHT);
+    int out_x =
+        GET_MASK(d->pvideo.regs[NV_PVIDEO_POINT_OUT], NV_PVIDEO_POINT_OUT_X);
+    int out_y =
+        GET_MASK(d->pvideo.regs[NV_PVIDEO_POINT_OUT], NV_PVIDEO_POINT_OUT_Y);
+
+    /* TODO: color keys */
+    assert(offset + in_pitch * in_height <= limit);
+    hwaddr end = base + offset + in_pitch * in_height;
+    assert(end <= memory_region_size(d->vram));
+
+    glActiveTexture(GL_TEXTURE0 + 1);
+    glBindTexture(GL_TEXTURE_2D, g_nv2a->pgraph.disp_rndr.pvideo_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    uint8_t *tex_rgba = convert_texture_data__CR8YB8CB8YA8(
+        d->vram_ptr + base + offset, in_width, in_height, in_pitch);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, in_width, in_height, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, tex_rgba);
+    g_free(tex_rgba);
+    glUniform1i(d->pgraph.disp_rndr.pvideo_tex_loc, 1);
+    glUniform4f(d->pgraph.disp_rndr.pvideo_pos_loc,
+                out_x, out_y, out_width, out_height);
 }
 
 static void pgraph_render_display(NV2AState *d, SurfaceBinding *surface)
@@ -3699,6 +3916,7 @@ static void pgraph_render_display(NV2AState *d, SurfaceBinding *surface)
     glBindBuffer(GL_ARRAY_BUFFER, d->pgraph.disp_rndr.vbo);
     glUseProgram(d->pgraph.disp_rndr.prog);
     glProgramUniform1i(d->pgraph.disp_rndr.prog, d->pgraph.disp_rndr.tex_loc, 0);
+    pgraph_render_display_pvideo_overlay(d);
 
     glViewport(0, 0, surface->width, surface->height);
     glColorMask(true, true, true, true);
@@ -3736,21 +3954,21 @@ void pgraph_gl_sync(NV2AState *d)
 
     // Switch back to original context
     glo_set_current(g_nv2a_context_render);
+
+    qemu_event_set(&d->pgraph.gl_sync_complete);
 }
 
 int nv2a_get_framebuffer_surface(void)
 {
     NV2AState *d = g_nv2a;
     PGRAPHState *pg = &d->pgraph;
-    GLuint buffer = 0;
 
     qemu_mutex_lock(&d->pfifo.lock);
-
-    // Lookup surface in surface cache
     // FIXME: Possible race condition with pgraph, consider lock
     SurfaceBinding *surface = pgraph_surface_get(d, d->pcrtc.start);
     if (surface == NULL || !surface->color) {
-        goto done;
+        qemu_mutex_unlock(&d->pfifo.lock);
+        return 0;
     }
 
     assert(surface->color);
@@ -3762,18 +3980,13 @@ int nv2a_get_framebuffer_surface(void)
         );
 
     surface->frame_time = pg->frame_time;
-    pg->gl_sync_pending = true;
-    do {
-        d->pfifo.fifo_kick = true;
-        qemu_cond_broadcast(&d->pfifo.fifo_cond);
-        qemu_cond_wait(&d->pfifo.fifo_idle_cond, &d->pfifo.lock);
-    } while (pg->gl_sync_pending);
-
-    buffer = pg->gl_display_buffer;
-
-done:
+    qemu_event_reset(&d->pgraph.gl_sync_complete);
+    atomic_set(&pg->gl_sync_pending, true);
+    pfifo_kick(d);
     qemu_mutex_unlock(&d->pfifo.lock);
-    return buffer;
+    qemu_event_wait(&d->pgraph.gl_sync_complete);
+
+    return pg->gl_display_buffer;
 }
 
 static bool pgraph_check_surface_to_texture_compatibility(
@@ -3844,15 +4057,13 @@ static void pgraph_wait_for_surface_download(SurfaceBinding *e)
     NV2AState *d = g_nv2a;
 
     if (atomic_read(&e->draw_dirty)) {
+        qemu_mutex_lock(&d->pfifo.lock);
+        qemu_event_reset(&d->pgraph.downloads_complete);
         atomic_set(&e->download_pending, true);
         atomic_set(&d->pgraph.downloads_pending, true);
-
-        qemu_mutex_lock(&d->pfifo.lock);
-        do {
-            qemu_cond_broadcast(&d->pfifo.fifo_cond);
-            qemu_cond_wait(&d->pfifo.fifo_idle_cond, &d->pfifo.lock);
-        } while (atomic_read(&e->download_pending));
+        pfifo_kick(d);
         qemu_mutex_unlock(&d->pfifo.lock);
+        qemu_event_wait(&d->pgraph.downloads_complete);
     }
 }
 
@@ -3869,14 +4080,16 @@ static void pgraph_surface_access_callback(
     assert(offset < e->size);
 
     if (atomic_read(&e->draw_dirty)) {
-        NV2A_XPRINTF(DBG_SURFACE_SYNC, "Surface accessed at %08lx+%lx\n",
-            e->vram_addr, offset);
+        NV2A_XPRINTF(DBG_SURFACE_SYNC,
+                     "Surface accessed at %" HWADDR_PRIx "+%" HWADDR_PRIx "\n",
+                     e->vram_addr, offset);
         pgraph_wait_for_surface_download(e);
     }
 
     if (write && !atomic_read(&e->upload_pending)) {
-        NV2A_XPRINTF(DBG_SURFACE_SYNC, "Surface write at %08lx+%lx\n",
-            e->vram_addr, offset);
+        NV2A_XPRINTF(DBG_SURFACE_SYNC,
+                     "Surface write at %" HWADDR_PRIx "+%" HWADDR_PRIx "\n",
+                     e->vram_addr, offset);
         atomic_set(&e->upload_pending, true);
     }
 }
@@ -4007,16 +4220,19 @@ static void pgraph_download_surface_data(NV2AState *d,
 
     // FIXME: Respect write enable at last TOU?
 
+    nv2a_profile_inc_counter(NV2A_PROF_SURF_DOWNLOAD);
+
     PGRAPHState *pg = &d->pgraph;
     uint8_t *data = d->vram_ptr;
     uint8_t *buf = data + surface->vram_addr;
 
     NV2A_XPRINTF(DBG_SURFACE_SYNC,
-        "[GPU->RAM] %s (%s) surface @ %lx (w=%d,h=%d,p=%d,bpp=%d)\n",
-        surface->color ? "COLOR" : "ZETA", surface->swizzle ? "sz" : "lin",
-        surface->vram_addr, surface->width, surface->height,
-        surface->pitch, surface->bytes_per_pixel
-        );
+                 "[GPU->RAM] %s (%s) surface @ %" HWADDR_PRIx
+                 " (w=%d,h=%d,p=%d,bpp=%d)\n",
+                 surface->color ? "COLOR" : "ZETA",
+                 surface->swizzle ? "sz" : "lin", surface->vram_addr,
+                 surface->width, surface->height, surface->pitch,
+                 surface->bytes_per_pixel);
 
     // Bind destination surface to framebuffer
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
@@ -4100,6 +4316,8 @@ void pgraph_process_pending_downloads(NV2AState *d)
     QTAILQ_FOREACH(surface, &d->pgraph.surfaces, entry) {
         pgraph_download_surface_data(d, surface, false);
     }
+
+    qemu_event_set(&d->pgraph.downloads_complete);
 }
 
 static void pgraph_upload_surface_data(
@@ -4111,12 +4329,15 @@ static void pgraph_upload_surface_data(
         return;
     }
 
+    nv2a_profile_inc_counter(NV2A_PROF_SURF_UPLOAD);
+
     NV2A_XPRINTF(DBG_SURFACE_SYNC,
-        "[RAM->GPU] %s (%s) surface @ %lx (w=%d,h=%d,p=%d,bpp=%d)\n",
-        surface->color ? "COLOR" : "ZETA", surface->swizzle ? "sz" : "lin",
-        surface->vram_addr, surface->width, surface->height,
-        surface->pitch, surface->bytes_per_pixel
-        );
+                 "[RAM->GPU] %s (%s) surface @ %" HWADDR_PRIx
+                 " (w=%d,h=%d,p=%d,bpp=%d)\n",
+                 surface->color ? "COLOR" : "ZETA",
+                 surface->swizzle ? "sz" : "lin", surface->vram_addr,
+                 surface->width, surface->height, surface->pitch,
+                 surface->bytes_per_pixel);
 
     PGRAPHState *pg = &d->pgraph;
 
@@ -4149,7 +4370,8 @@ static void pgraph_upload_surface_data(
     }
 
     // This is VRAM so we can't do this inplace!
-    uint8_t *flipped_buf = (uint8_t*)g_malloc(surface->size);
+    uint8_t *flipped_buf = (uint8_t *)g_malloc(
+        surface->height * surface->width * surface->bytes_per_pixel);
     unsigned int irow;
     for (irow = 0; irow < surface->height; irow++) {
         memcpy(&flipped_buf[surface->width * (surface->height - irow - 1)
@@ -4381,7 +4603,7 @@ static void pgraph_update_surface_part(NV2AState *d, bool upload, bool color)
                            color ? "color" : "zeta",
                            color ? pg->surface_shape.color_format
                                  : pg->surface_shape.zeta_format,
-                           width, height, surface->vram_addr);
+                           width, height, surface->offset);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -4552,6 +4774,34 @@ static void pgraph_update_surface(NV2AState *d, bool upload,
     pgraph_surface_evict_old(d);
 }
 
+struct pgraph_texture_possibly_dirty_struct {
+    hwaddr addr, end;
+};
+
+static void pgraph_mark_textures_possibly_dirty_visitor(Lru *lru, LruNode *node, void *opaque)
+{
+    struct pgraph_texture_possibly_dirty_struct *test =
+        (struct pgraph_texture_possibly_dirty_struct *)opaque;
+
+    struct TextureLruNode *tnode = container_of(node, TextureLruNode, node);
+    if (tnode->binding == NULL || tnode->possibly_dirty) {
+        return;
+    }
+
+    uintptr_t k_tex_addr = tnode->key.texture_vram_offset;
+    uintptr_t k_tex_end = k_tex_addr + tnode->key.texture_length - 1;
+    bool overlapping = !(test->addr > k_tex_end || k_tex_addr > test->end);
+
+    if (tnode->key.palette_length > 0) {
+        uintptr_t k_pal_addr = tnode->key.palette_vram_offset;
+        uintptr_t k_pal_end = k_pal_addr + tnode->key.palette_length - 1;
+        overlapping |= !(test->addr > k_pal_end || k_pal_addr > test->end);
+    }
+
+    tnode->possibly_dirty |= overlapping;
+}
+
+
 static void pgraph_mark_textures_possibly_dirty(NV2AState *d,
     hwaddr addr, hwaddr size)
 {
@@ -4559,25 +4809,14 @@ static void pgraph_mark_textures_possibly_dirty(NV2AState *d,
     addr &= TARGET_PAGE_MASK;
     assert(end <= memory_region_size(d->vram));
 
-    struct lru_node *node = d->pgraph.texture_cache.active;
-    for (; node; node = node->next) {
-        struct TextureKey *k = container_of(node, struct TextureKey, node);
-        if (k->binding == NULL || k->possibly_dirty) {
-            continue;
-        }
+    struct pgraph_texture_possibly_dirty_struct test = {
+        .addr = addr,
+        .end = end,
+    };
 
-        uintptr_t k_tex_addr = k->texture_vram_offset;
-        uintptr_t k_tex_end = k_tex_addr + k->texture_length - 1;
-        bool overlapping = !(addr > k_tex_end || k_tex_addr > end);
-
-        if (k->palette_length > 0) {
-            uintptr_t k_pal_addr = k->palette_vram_offset;
-            uintptr_t k_pal_end = k_pal_addr + k->palette_length - 1;
-            overlapping |= !(addr > k_pal_end || k_pal_addr > end);
-        }
-
-        k->possibly_dirty |= overlapping;
-    }
+    lru_visit_active(&d->pgraph.texture_cache,
+                     pgraph_mark_textures_possibly_dirty_visitor,
+                     &test);
 }
 
 static bool pgraph_check_texture_dirty(NV2AState *d, hwaddr addr, hwaddr size)
@@ -4680,6 +4919,8 @@ static void pgraph_bind_textures(NV2AState *d)
             glBindTexture(GL_TEXTURE_3D, 0);
             continue;
         }
+
+        nv2a_profile_inc_counter(NV2A_PROF_TEX_BIND);
 
         if (!pg->texture_dirty[i] && pg->texture_binding[i]) {
             glBindTexture(pg->texture_binding[i]->gl_target,
@@ -4889,9 +5130,9 @@ static void pgraph_bind_textures(NV2AState *d)
 
         // Search for existing texture binding in cache
         uint64_t tex_binding_hash = fast_hash((uint8_t*)&key, sizeof(key));
-        struct lru_node *found = lru_lookup(&pg->texture_cache,
-                                            tex_binding_hash, &key);
-        TextureKey *key_out = container_of(found, struct TextureKey, node);
+        LruNode *found = lru_lookup(&pg->texture_cache,
+                                     tex_binding_hash, &key);
+        TextureLruNode *key_out = container_of(found, TextureLruNode, node);
         bool possibly_dirty = (key_out->binding == NULL)
                               || key_out->possibly_dirty;
 
@@ -5054,6 +5295,7 @@ static void pgraph_update_memory_buffer(NV2AState *d, hwaddr addr, hwaddr size,
                                                 addr,
                                                 end - addr,
                                                 DIRTY_MEMORY_NV2A)) {
+        nv2a_profile_inc_counter(NV2A_PROF_GEOM_BUFFER_UPDATE_1);
         glBufferSubData(GL_ARRAY_BUFFER, addr, end - addr, d->vram_ptr + addr);
     }
 }
@@ -5102,44 +5344,51 @@ static void pgraph_bind_vertex_attributes(NV2AState *d,
                 unsigned int out_stride = attribute->converted_size
                                         * attribute->converted_count;
 
-                if (num_elements > attribute->converted_elements) {
+                VertexKey k;
+                memset(&k, 0, sizeof(VertexKey));
+                k.count = num_elements;
+                k.gl_type = attribute->gl_type;
+                k.gl_normalize = attribute->gl_normalize;
+                k.stride = out_stride;
+                uint64_t h  = fast_hash(data, num_elements * in_stride);
+                LruNode *node = lru_lookup(&pg->vertex_cache, h, &k);
+                VertexLruNode *found = container_of(node, VertexLruNode, node);
+                glBindBuffer(GL_ARRAY_BUFFER, found->gl_buffer);
+
+                if (!found->initialized) {
+                    nv2a_profile_inc_counter(NV2A_PROF_GEOM_CONV);
                     attribute->converted_buffer = (uint8_t*)g_realloc(
                         attribute->converted_buffer,
                         num_elements * out_stride);
-                }
 
-                for (j=attribute->converted_elements; j<num_elements; j++) {
-                    uint8_t *in = data + j * in_stride;
-                    uint8_t *out = attribute->converted_buffer + j * out_stride;
+                    for (j=0; j < num_elements; j++) {
+                        uint8_t *in = data + j * in_stride;
+                        uint8_t *out = attribute->converted_buffer + j * out_stride;
 
-                    switch (attribute->format) {
-                    case NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_CMP: {
-                        uint32_t p = ldl_le_p((uint32_t*)in);
-                        float *xyz = (float*)out;
-                        xyz[0] = ((int32_t)(((p >>  0) & 0x7FF) << 21) >> 21)
-                                                                      / 1023.0f;
-                        xyz[1] = ((int32_t)(((p >> 11) & 0x7FF) << 21) >> 21)
-                                                                      / 1023.0f;
-                        xyz[2] = ((int32_t)(((p >> 22) & 0x3FF) << 22) >> 22)
-                                                                       / 511.0f;
-                        break;
+                        switch (attribute->format) {
+                        case NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_CMP: {
+                            uint32_t p = ldl_le_p((uint32_t*)in);
+                            float *xyz = (float*)out;
+                            xyz[0] = ((int32_t)(((p >>  0) & 0x7FF) << 21) >> 21)
+                                                                          / 1023.0f;
+                            xyz[1] = ((int32_t)(((p >> 11) & 0x7FF) << 21) >> 21)
+                                                                          / 1023.0f;
+                            xyz[2] = ((int32_t)(((p >> 22) & 0x3FF) << 22) >> 22)
+                                                                           / 511.0f;
+                            break;
+                        }
+                        default:
+                            assert(false);
+                            break;
+                        }
                     }
-                    default:
-                        assert(false);
-                        break;
-                    }
-                }
 
-
-                glBindBuffer(GL_ARRAY_BUFFER, attribute->gl_converted_buffer);
-                if (num_elements != attribute->converted_elements) {
                     glBufferData(GL_ARRAY_BUFFER,
                                  num_elements * out_stride,
                                  attribute->converted_buffer,
-                                 GL_DYNAMIC_DRAW);
-                    attribute->converted_elements = num_elements;
+                                 GL_STATIC_DRAW);
+                    found->initialized = true;
                 }
-
 
                 glVertexAttribPointer(i,
                     attribute->converted_count,
@@ -5203,9 +5452,10 @@ static unsigned int pgraph_bind_inline_array(NV2AState *d)
 
     NV2A_DPRINTF("draw inline array %d, %d\n", vertex_size, index_count);
 
+    nv2a_profile_inc_counter(NV2A_PROF_GEOM_BUFFER_UPDATE_2);
     glBindBuffer(GL_ARRAY_BUFFER, pg->gl_inline_array_buffer);
     glBufferData(GL_ARRAY_BUFFER, pg->inline_array_length*4, pg->inline_array,
-                 GL_DYNAMIC_DRAW);
+                 GL_STREAM_DRAW);
 
     pgraph_bind_vertex_attributes(d, index_count, true, vertex_size);
 
@@ -5315,6 +5565,7 @@ static void upload_gl_texture(GLenum gl_target,
                               const uint8_t *palette_data)
 {
     ColorFormatInfo f = kelvin_color_format_map[s.color_format];
+    nv2a_profile_inc_counter(NV2A_PROF_TEX_UPLOAD);
 
     switch(gl_target) {
     case GL_TEXTURE_1D:
@@ -5602,34 +5853,29 @@ static void texture_binding_destroy(gpointer data)
 }
 
 /* functions for texture LRU cache */
-static struct lru_node *texture_cache_entry_init(struct lru_node *obj, void *key)
+static void texture_cache_entry_init(Lru *lru, LruNode *node, void *key)
 {
-    struct TextureKey *k_out = container_of(obj, struct TextureKey, node);
-    struct TextureKey *k_in = (struct TextureKey *)key;
-    memcpy(k_out, k_in, sizeof(struct TextureKey));
-    k_out->binding = NULL;
-    return obj;
+    TextureLruNode *tnode = container_of(node, TextureLruNode, node);
+    memcpy(&tnode->key, key, sizeof(TextureKey));
+
+    tnode->binding = NULL;
+    tnode->possibly_dirty = false;
 }
 
-static struct lru_node *texture_cache_entry_deinit(struct lru_node *obj)
+static void texture_cache_entry_post_evict(Lru *lru, LruNode *node)
 {
-    struct TextureKey *a = container_of(obj, struct TextureKey, node);
-    if (a->binding) {
-        texture_binding_destroy(a->binding);
+    TextureLruNode *tnode = container_of(node, TextureLruNode, node);
+    if (tnode->binding) {
+        texture_binding_destroy(tnode->binding);
+        tnode->binding = NULL;
+        tnode->possibly_dirty = false;
     }
-    return obj;
 }
 
-static int texture_cache_entry_compare(struct lru_node *obj, void *key)
+static bool texture_cache_entry_compare(Lru *lru, LruNode *node, void *key)
 {
-    struct TextureKey *a = container_of(obj, struct TextureKey, node);
-    struct TextureKey *b = (struct TextureKey *)key;
-    return memcmp(&a->state, &b->state, sizeof(a->state))
-        || (a->texture_vram_offset != b->texture_vram_offset)
-        || (a->texture_length != b->texture_length)
-        || (a->palette_vram_offset != b->palette_vram_offset)
-        || (a->palette_length != b->palette_length)
-        ;
+    TextureLruNode *tnode = container_of(node, TextureLruNode, node);
+    return memcmp(&tnode->key, key, sizeof(TextureKey));
 }
 
 /* hash and equality for shader cache hash table */
@@ -5716,5 +5962,5 @@ static unsigned int kelvin_map_texgen(uint32_t parameter, unsigned int channel)
 
 static uint64_t fast_hash(const uint8_t *data, size_t len)
 {
-    return XXH64(data, len, 0);
+    return XXH3_64bits(data, len);
 }

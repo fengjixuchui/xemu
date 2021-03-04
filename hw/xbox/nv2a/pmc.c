@@ -3,7 +3,7 @@
  *
  * Copyright (c) 2012 espes
  * Copyright (c) 2015 Jannik Vogel
- * Copyright (c) 2018 Matt Borgerson
+ * Copyright (c) 2018-2021 Matt Borgerson
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -30,9 +30,9 @@ uint64_t pmc_read(void *opaque, hwaddr addr, unsigned int size)
     switch (addr) {
     case NV_PMC_BOOT_0:
         /* chipset and stepping:
-         * NV2A, A02, Rev 0 */
+         * NV2A, A03, Rev 0 */
 
-        r = 0x02A000A2;
+        r = 0x02A000A3;
         break;
     case NV_PMC_INTR_0:
         /* Shows which functional units have pending IRQ */

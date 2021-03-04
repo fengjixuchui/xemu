@@ -2,7 +2,7 @@
  * QEMU Xbox PCI buses implementation
  *
  * Copyright (c) 2012 espes
- * Copyright (c) 2018-2020 Matt Borgerson
+ * Copyright (c) 2018-2021 Matt Borgerson
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -277,7 +277,7 @@ static void xbox_smbus_class_init(ObjectClass *klass, void *data)
     k->realize = xbox_smbus_realize;
     k->vendor_id = PCI_VENDOR_ID_NVIDIA;
     k->device_id = PCI_DEVICE_ID_NVIDIA_NFORCE_SMBUS;
-    k->revision = 161;
+    k->revision = 177;
     k->class_id = PCI_CLASS_SERIAL_SMBUS;
 
     dc->desc = "nForce PCI System Management";
@@ -392,6 +392,7 @@ static void xbox_lpc_class_init(ObjectClass *klass, void *data)
     //k->config_write = xbox_lpc_config_write;
     k->vendor_id = PCI_VENDOR_ID_NVIDIA;
     k->device_id = PCI_DEVICE_ID_NVIDIA_NFORCE_LPC;
+    /* FIXME - correct revision for this is 0xB2 (178) for retail 1.0 Xbox, causes known USB bug */
     k->revision = 212;
     k->class_id = PCI_CLASS_BRIDGE_ISA;
 

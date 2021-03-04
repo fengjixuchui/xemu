@@ -318,6 +318,9 @@ then
     git_submodules="ui/keycodemapdb"
     git_submodules="$git_submodules tests/fp/berkeley-testfloat-3"
     git_submodules="$git_submodules tests/fp/berkeley-softfloat-3"
+
+    # xemu extras
+    git_submodules="$git_submodules ui/imgui ui/implot hw/xbox/nv2a/xxHash"
 else
     git_update=no
     git_submodules=""
@@ -2189,7 +2192,6 @@ EOF
 # Check we support --no-pie first; we will need this for building ROMs.
 if compile_prog "-Werror -fno-pie" "-no-pie"; then
   CFLAGS_NOPIE="-fno-pie"
-  LDFLAGS_NOPIE="-no-pie"
 fi
 
 if test "$static" = "yes"; then
@@ -2205,7 +2207,6 @@ if test "$static" = "yes"; then
   fi
 elif test "$pie" = "no"; then
   QEMU_CFLAGS="$CFLAGS_NOPIE $QEMU_CFLAGS"
-  QEMU_LDFLAGS="$LDFLAGS_NOPIE $QEMU_LDFLAGS"
 elif compile_prog "-Werror -fPIE -DPIE" "-pie"; then
   QEMU_CFLAGS="-fPIE -DPIE $QEMU_CFLAGS"
   QEMU_LDFLAGS="-pie $QEMU_LDFLAGS"
@@ -4565,6 +4566,15 @@ else
 fi
 
 ##########################################
+# libsamplerate probe
+if $pkg_config --exists samplerate; then
+    QEMU_CFLAGS="$QEMU_CFLAGS $($pkg_config --cflags samplerate)"
+    LIBS="$LIBS $($pkg_config --libs samplerate)"
+else
+    feature_not_found "samplerate" "Install libsamplerate0-dev"
+fi
+
+##########################################
 # libxml2 probe
 if test "$libxml2" != "no" ; then
     if $pkg_config --exists libxml-2.0; then
@@ -6598,9 +6608,12 @@ if test "$gcov" = "yes" ; then
   QEMU_CFLAGS="-fprofile-arcs -ftest-coverage -g $QEMU_CFLAGS"
   QEMU_LDFLAGS="-fprofile-arcs -ftest-coverage $QEMU_LDFLAGS"
 elif test "$fortify_source" = "yes" ; then
-  CFLAGS="-O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 $CFLAGS"
-elif test "$debug" = "no"; then
-  CFLAGS="-O2 $CFLAGS"
+  CFLAGS="-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 $CFLAGS"
+
+# Note: xemu build.sh script will pass in appropriate optimization level
+#   CFLAGS="-O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 $CFLAGS"
+# elif test "$debug" = "no"; then
+#   CFLAGS="-O2 $CFLAGS"
 fi
 
 if test "$have_asan" = "yes"; then
@@ -8069,7 +8082,6 @@ if test "$sparse" = "yes" ; then
   echo "QEMU_CFLAGS  += -Wbitwise -Wno-transparent-union -Wno-old-initializer -Wno-non-pointer-null" >> $config_host_mak
 fi
 echo "QEMU_LDFLAGS=$QEMU_LDFLAGS" >> $config_host_mak
-echo "LDFLAGS_NOPIE=$LDFLAGS_NOPIE" >> $config_host_mak
 echo "LD_REL_FLAGS=$LD_REL_FLAGS" >> $config_host_mak
 echo "LD_I386_EMULATION=$ld_i386_emulation" >> $config_host_mak
 echo "LIBS+=$LIBS" >> $config_host_mak

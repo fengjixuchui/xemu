@@ -2925,6 +2925,16 @@ void qemu_init(int argc, char **argv, char **envp)
     // reporting. This should be replaced eventually, but is "good enough" for
     // now.
     //
+    for (int i = 1; i < argc; i++) {
+        if (argv[i] && strcmp(argv[i], "-config_path") == 0) {
+            argv[i] = NULL;
+            if (i < argc - 1 && argv[i+1]) {
+                xemu_settings_set_path(argv[i+1]);
+                argv[i+1] = NULL;
+            }
+            break;
+        }
+    }
     xemu_settings_load();
     int first_boot = xemu_settings_did_fail_to_load();
     int fake_argc = 32 + argc;
@@ -3066,6 +3076,19 @@ void qemu_init(int argc, char **argv, char **envp)
 
     const char *dvd_path = "";
     xemu_settings_get_string(XEMU_SETTINGS_SYSTEM_DVD_PATH, &dvd_path);
+
+    // Allow overriding the dvd path from command line
+    for (int i = 1; i < argc; i++) {
+        if (argv[i] && strcmp(argv[i], "-dvd_path") == 0) {
+            argv[i] = NULL;
+            if (i < argc - 1 && argv[i+1]) {
+                dvd_path = argv[i+1];
+                argv[i+1] = NULL;
+            }
+            break;
+        }
+    }
+
     if (strlen(dvd_path) > 0) {
         if (xemu_check_file(dvd_path)) {
             char *msg = g_strdup_printf("Failed to open DVD image file '%s'. Please check machine settings.", dvd_path);
@@ -3093,7 +3116,9 @@ void qemu_init(int argc, char **argv, char **envp)
 #endif
 
     for (int i = 1; i < argc; i++) {
-        fake_argv[fake_argc++] = argv[i];
+        if (argv[i] != NULL) {
+            fake_argv[fake_argc++] = argv[i];
+        }
     }
 
     printf("Created QEMU launch parameters: ");

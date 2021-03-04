@@ -3,7 +3,7 @@
  *
  * Copyright (c) 2012 espes
  * Copyright (c) 2015 Jannik Vogel
- * Copyright (c) 2018-2020 Matt Borgerson
+ * Copyright (c) 2018-2021 Matt Borgerson
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -102,12 +102,12 @@ typedef struct VertexAttribute {
     unsigned int converted_count;
 
     float *inline_buffer;
+    bool inline_buffer_populated;
 
     GLint gl_count;
     GLenum gl_type;
     GLboolean gl_normalize;
 
-    GLuint gl_converted_buffer;
     GLuint gl_inline_buffer;
 } VertexAttribute;
 
@@ -181,16 +181,33 @@ typedef struct TextureBinding {
 } TextureBinding;
 
 typedef struct TextureKey {
-    struct lru_node node;
     TextureShape state;
-    TextureBinding *binding;
-
     hwaddr texture_vram_offset;
     hwaddr texture_length;
     hwaddr palette_vram_offset;
     hwaddr palette_length;
-    bool possibly_dirty;
 } TextureKey;
+
+typedef struct TextureLruNode {
+    LruNode node;
+    TextureKey key;
+    TextureBinding *binding;
+    bool possibly_dirty;
+} TextureLruNode;
+
+typedef struct VertexKey {
+    size_t count;
+    GLuint gl_type;
+    GLboolean gl_normalize;
+    size_t stride;
+} VertexKey;
+
+typedef struct VertexLruNode {
+    LruNode node;
+    VertexKey key;
+    GLuint gl_buffer;
+    bool initialized;
+} VertexLruNode;
 
 typedef struct KelvinState {
     hwaddr object_instance;
@@ -231,6 +248,10 @@ typedef struct PGRAPHState {
     struct disp_rndr {
         GLuint fbo, vao, vbo, prog;
         GLuint tex_loc;
+        GLuint pvideo_tex;
+        GLint pvideo_enable_loc;
+        GLint pvideo_tex_loc;
+        GLint pvideo_pos_loc;
     } disp_rndr;
 
     /* subchannels state we're not sure the location of... */
@@ -254,10 +275,11 @@ typedef struct PGRAPHState {
         int height;
     } surface_binding_dim; // FIXME: Refactor
     bool downloads_pending;
+    QemuEvent downloads_complete;
 
     hwaddr dma_a, dma_b;
-    struct lru texture_cache;
-    struct TextureKey *texture_cache_entries;
+    Lru texture_cache;
+    struct TextureLruNode *texture_cache_entries;
     bool texture_dirty[NV2A_MAX_TEXTURES];
     TextureBinding *texture_binding[NV2A_MAX_TEXTURES];
 
@@ -310,6 +332,9 @@ typedef struct PGRAPHState {
 
     VertexAttribute vertex_attributes[NV2A_VERTEXSHADER_ATTRIBUTES];
 
+    Lru vertex_cache;
+    struct VertexLruNode *vertex_cache_entries;
+
     unsigned int inline_array_length;
     uint32_t inline_array[NV2A_MAX_BATCH_LENGTH];
     GLuint gl_inline_array_buffer;
@@ -325,7 +350,6 @@ typedef struct PGRAPHState {
     GLint gl_draw_arrays_start[1000];
     GLsizei gl_draw_arrays_count[1000];
 
-    GLuint gl_element_buffer;
     GLuint gl_memory_buffer;
     GLuint gl_vertex_array;
 
@@ -333,10 +357,10 @@ typedef struct PGRAPHState {
 
     bool waiting_for_nop;
     bool waiting_for_flip;
-    bool waiting_for_fifo_access;
     bool waiting_for_context_switch;
     bool flush_pending;
     bool gl_sync_pending;
+    QemuEvent gl_sync_complete;
 } PGRAPHState;
 
 typedef struct NV2AState {
@@ -470,8 +494,9 @@ void *nv_dma_map(NV2AState *d, hwaddr dma_obj_address, hwaddr *len);
 void pgraph_init(NV2AState *d);
 void pgraph_destroy(PGRAPHState *pg);
 void pgraph_context_switch(NV2AState *d, unsigned int channel_id);
-void pgraph_method(NV2AState *d, unsigned int subchannel,
-                   unsigned int method, uint32_t parameter);
+int pgraph_method(NV2AState *d, unsigned int subchannel,
+                   unsigned int method, uint32_t parameter,
+                   uint32_t *parameters, size_t num_words_available);
 void pgraph_gl_sync(NV2AState *d);
 void pgraph_process_pending_downloads(NV2AState *d);
 
